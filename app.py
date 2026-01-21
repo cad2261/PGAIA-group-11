@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
-# this is audrey 
 st.set_page_config(page_title="Finance Assistant MVP", layout="wide")
 
 st.title("💰 Finance Assistant – Streamlit Test")
