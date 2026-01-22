@@ -27,7 +27,7 @@ OPENAI_API_KEY = "xx"  # Get your key from https://platform.openai.com/api-keys
 
 # Page configuration
 st.set_page_config(
-    page_title="Finance Assistant MVP v4",
+    page_title="Finance Assistant MVP v5",
     page_icon="💰",
     layout="wide",
     initial_sidebar_state="expanded"
