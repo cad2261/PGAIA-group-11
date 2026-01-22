@@ -3,7 +3,7 @@ import pandas as pd
 from datetime import datetime
 st.set_page_config(page_title="Finance Assistant MVP", layout="wide")
 
-st.title("💰 Finance Assistant – Streamlit Test")
+st.title("💰 Finance Assistant – Streamlit Test v1")
 
 # ---- Fake users (for now) ----
 USERS = [
