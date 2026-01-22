@@ -23,7 +23,7 @@ except ImportError:
 # API Keys Configuration
 # ============================================================================
 # OpenAI API Key - Replace with your actual key
-OPENAI_API_KEY = "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"  # Get your key from https://platform.openai.com/api-keys
+OPENAI_API_KEY = "xx"  # Get your key from https://platform.openai.com/api-keys
 
 # Page configuration
 st.set_page_config(
