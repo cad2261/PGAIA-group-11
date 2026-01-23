@@ -10,24 +10,19 @@ import json
 import tempfile
 import os
 from typing import List, Dict, Optional
+from store_locator import get_nearby_grocery_stores, filter_stores_by_name
 
-# Try to import PDF libraries
-try:
-    import PyPDF2
-    PDF_AVAILABLE = True
-except ImportError:
-    PDF_AVAILABLE = False
-    PyPDF2 = None
+# No external PDF libraries needed - using OpenAI API directly
 
 # ============================================================================
 # API Keys Configuration
 # ============================================================================
 # OpenAI API Key - Replace with your actual key
-OPENAI_API_KEY = "xx"  # Get your key from https://platform.openai.com/api-keys
+OPENAI_API_KEY = "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"  # Get your key from https://platform.openai.com/api-keys
 
 # Page configuration
 st.set_page_config(
-    page_title="Finance Assistant MVP v5",
+    page_title="Accountable AI v1",
     page_icon="💰",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -40,20 +35,44 @@ if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "financial_profile" not in st.session_state:
     st.session_state.financial_profile = ""
+if "pending_transactions" not in st.session_state:
+    st.session_state.pending_transactions = pd.DataFrame()
+if "review_index" not in st.session_state:
+    st.session_state.review_index = 0
+if "upload_key" not in st.session_state:
+    st.session_state.upload_key = 0
+if "user_profile" not in st.session_state:
+    st.session_state.user_profile = {
+        "age_range": None,
+        "employment_status": None,
+        "occupation": None,
+        "location_country": None,
+        "location_city": None,
+        "profile_completed": False
+    }
+if "show_questionnaire" not in st.session_state:
+    st.session_state.show_questionnaire = False
+if "last_location" not in st.session_state:
+    st.session_state.last_location = {"country": None, "city": None, "state": None}
 
 # Fixed expense categories
 EXPENSE_CATEGORIES = [
     "Housing",
-    "Groceries",
-    "Dining",
+    "Utilities",
+    "Food & Dining",
     "Transportation",
     "Shopping",
-    "Utilities",
-    "Travel",
-    "Entertainment",
     "Health",
-    "Transfers"
+    "Education",
+    "Entertainment",
+    "Travel",
+    "Subscriptions",
+    "Fitness & Personal Care",
+    "Miscellaneous"
 ]
+
+# Income is just a single category (no subcategories for now)
+INCOME_CATEGORY = "Income"
 
 # ============================================================================
 # Helper Functions
@@ -71,182 +90,227 @@ def get_openai_client() -> Optional[OpenAI]:
     return OpenAI(api_key=OPENAI_API_KEY)
 
 
-def extract_text_from_pdf(pdf_file) -> str:
+def extract_transactions_from_pdf_with_openai(client: OpenAI, pdf_file) -> List[Dict]:
     """
-    Extract text from PDF file using PyPDF2.
-    Returns extracted text as string.
-    """
-    if not PDF_AVAILABLE:
-        st.error("❌ PyPDF2 is not installed. Please install it with: pip install PyPDF2")
-        return ""
-    
-    try:
-        pdf_file.seek(0)
-        pdf_reader = PyPDF2.PdfReader(pdf_file)
-        text = ""
-        for page in pdf_reader.pages:
-            text += page.extract_text() + "\n"
-        return text
-    except Exception as e:
-        st.error(f"❌ Error extracting text from PDF: {str(e)}")
-        return ""
-
-
-def extract_transactions_with_openai(client: OpenAI, pdf_text: str) -> List[Dict]:
-    """
-    Use OpenAI API to extract transactions from PDF text.
+    Use OpenAI API to extract transactions directly from PDF file.
+    Uploads PDF to OpenAI and uses Assistants API to extract transactions.
     Returns list of transaction dictionaries.
     """
-    if not pdf_text or len(pdf_text.strip()) < 50:
-        return []
-    
     try:
-        # Truncate text if too long (OpenAI has token limits)
-        # Keep first 8000 characters which should be enough for most statements
-        text_sample = pdf_text[:8000] if len(pdf_text) > 8000 else pdf_text
+        # Reset file pointer and read PDF bytes
+        pdf_file.seek(0)
+        pdf_bytes = pdf_file.read()
         
-        prompt = f"""You are a financial assistant that extracts transactions from bank statement text.
+        # Save to temporary file for upload
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(pdf_bytes)
+            tmp_path = tmp_file.name
+        
+        try:
+            # Upload PDF file to OpenAI
+            with open(tmp_path, 'rb') as f:
+                uploaded_file = client.files.create(
+                    file=f,
+                    purpose='assistants'
+                )
+            
+            file_id = uploaded_file.id
+            
+            # Use Assistants API to extract transactions
+            prompt = """You are a financial assistant that extracts transactions from bank statement PDFs.
 
-Extract all financial transactions from the following bank statement text. For each transaction, identify:
+Extract all financial transactions from this bank statement PDF. For each transaction, identify:
 - posted_date (in YYYY-MM-DD format)
 - description_raw (the transaction description/merchant name)
 - merchant_guess (shortened merchant name, max 50 chars)
 - amount (as a positive number)
 - direction ("expense" if money going out, "income" if money coming in)
 
-Return a JSON object with a "transactions" array. Each transaction should have these exact fields:
-{{
-  "posted_date": "YYYY-MM-DD",
-  "description_raw": "full description",
-  "merchant_guess": "short merchant name",
-  "amount": 123.45,
-  "direction": "expense" or "income"
-}}
+CRITICAL: You MUST return ONLY a valid JSON object with a "transactions" array. Do not include any explanatory text, markdown, or code blocks. Return ONLY the raw JSON.
 
-Bank statement text:
-{text_sample}
+The JSON format must be exactly:
+{
+  "transactions": [
+    {
+      "posted_date": "YYYY-MM-DD",
+      "description_raw": "full description",
+      "merchant_guess": "short merchant name",
+      "amount": 123.45,
+      "direction": "expense"
+    }
+  ]
+}
 
-Return the JSON object with a "transactions" array:"""
-
-        # Try with JSON mode first (for supported models)
-        try:
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",  # Using gpt-4o-mini for better JSON parsing
-                messages=[
-                    {"role": "system", "content": "You are a financial assistant that extracts transactions from bank statements. Always return valid JSON. Return a JSON object with a 'transactions' array containing all transactions."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1,
-                max_tokens=2000,
-                response_format={"type": "json_object"}
+Return ONLY the JSON object, nothing else."""
+            
+            # Create assistant
+            assistant = client.beta.assistants.create(
+                name="Transaction Extractor",
+                instructions=prompt,
+                model="gpt-4o",
+                tools=[{"type": "code_interpreter"}]
             )
-        except Exception as e:
-            # Fallback to regular mode if JSON mode not supported
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "You are a financial assistant that extracts transactions from bank statements. Always return valid JSON arrays."},
-                    {"role": "user", "content": prompt + "\n\nIMPORTANT: Return ONLY a JSON array, no other text."}
-                ],
-                temperature=0.1,
-                max_tokens=2000
+            
+            # Create thread
+            thread = client.beta.threads.create()
+            
+            # Create message with file attachment using attachments parameter
+            message = client.beta.threads.messages.create(
+                thread_id=thread.id,
+                role="user",
+                content="Extract all transactions from the uploaded PDF file. Return ONLY a valid JSON object with a 'transactions' array. Do not include any text, markdown, or explanations - just the raw JSON.",
+                attachments=[{
+                    "file_id": file_id,
+                    "tools": [{"type": "code_interpreter"}]
+                }]
             )
-        
-        result = response.choices[0].message.content
-        
-        # Parse JSON response
-        try:
-            # Clean the response - remove markdown code blocks if present
+            
+            # Run assistant
+            run = client.beta.threads.runs.create(
+                thread_id=thread.id,
+                assistant_id=assistant.id
+            )
+            
+            # Wait for completion
+            import time
+            max_wait = 60  # 60 seconds max
+            waited = 0
+            while run.status in ['queued', 'in_progress'] and waited < max_wait:
+                time.sleep(2)
+                waited += 2
+                run = client.beta.threads.runs.retrieve(
+                    thread_id=thread.id,
+                    run_id=run.id
+                )
+            
+            if run.status != 'completed':
+                raise Exception(f"Run failed with status: {run.status}")
+            
+            # Get response
+            messages = client.beta.threads.messages.list(thread_id=thread.id)
+            result = messages.data[0].content[0].text.value
+            
+            # Clean up
+            try:
+                client.beta.assistants.delete(assistant.id)
+                client.files.delete(file_id)
+            except:
+                pass
+            
+            # Parse JSON from result
             result_clean = result.strip()
-            if result_clean.startswith("```json"):
-                result_clean = result_clean[7:]
-            if result_clean.startswith("```"):
-                result_clean = result_clean[3:]
-            if result_clean.endswith("```"):
-                result_clean = result_clean[:-3]
-            result_clean = result_clean.strip()
             
-            # Parse JSON
-            parsed = json.loads(result_clean)
+            # Remove markdown code blocks if present
+            if "```json" in result_clean:
+                # Extract content between ```json and ```
+                json_match = re.search(r'```json\s*(.*?)\s*```', result_clean, re.DOTALL)
+                if json_match:
+                    result_clean = json_match.group(1).strip()
+            elif "```" in result_clean:
+                # Extract content between ``` and ```
+                json_match = re.search(r'```\s*(.*?)\s*```', result_clean, re.DOTALL)
+                if json_match:
+                    result_clean = json_match.group(1).strip()
             
-            # Handle different response structures
+            # Try to find JSON object in the text
+            parsed = None
+            json_errors = []
+            
+            # First, try to parse the entire cleaned result
+            try:
+                parsed = json.loads(result_clean)
+            except json.JSONDecodeError as e:
+                json_errors.append(f"Direct parse failed: {str(e)}")
+                
+                # Try to find JSON object with transactions
+                patterns = [
+                    r'\{[^{}]*"transactions"\s*:\s*\[.*?\]\s*\}',  # { "transactions": [...] }
+                    r'\{.*?"transactions".*?\}',  # Any object with transactions
+                    r'\{[\s\S]*"transactions"[\s\S]*\}',  # More flexible
+                ]
+                
+                for pattern in patterns:
+                    json_match = re.search(pattern, result_clean, re.DOTALL)
+                    if json_match:
+                        try:
+                            parsed = json.loads(json_match.group())
+                            break
+                        except json.JSONDecodeError as e2:
+                            json_errors.append(f"Pattern match failed: {str(e2)}")
+                            continue
+                
+                # If still no match, try to find any JSON object
+                if parsed is None:
+                    json_match = re.search(r'\{.*?\}', result_clean, re.DOTALL)
+                    if json_match:
+                        try:
+                            parsed = json.loads(json_match.group())
+                        except:
+                            pass
+            
+            if parsed is None:
+                # Show what we got for debugging
+                st.warning(f"⚠️ Could not parse JSON from assistant response.")
+                with st.expander("View Assistant Response (for debugging)"):
+                    st.text(result[:2000] if len(result) > 2000 else result)
+                if json_errors:
+                    st.debug(f"JSON parsing errors: {json_errors[-1]}")
+                raise Exception("Could not parse JSON from assistant response")
+            
+            # Extract transactions array
             if isinstance(parsed, dict):
-                # Look for transactions array in the response
                 if "transactions" in parsed:
                     transactions_data = parsed["transactions"]
                 elif "data" in parsed:
                     transactions_data = parsed["data"]
-                elif "items" in parsed:
-                    transactions_data = parsed["items"]
                 else:
-                    # Check if any value is a list
-                    for key, value in parsed.items():
-                        if isinstance(value, list):
-                            transactions_data = value
-                            break
-                    else:
-                        # No list found, return empty
-                        transactions_data = []
+                    transactions_data = []
             elif isinstance(parsed, list):
                 transactions_data = parsed
             else:
                 transactions_data = []
-        except json.JSONDecodeError as e:
-            # Try to extract JSON from text if not pure JSON
-            json_match = re.search(r'\{[^{}]*"transactions"[^{}]*\[.*?\]', result, re.DOTALL)
-            if not json_match:
-                json_match = re.search(r'\[.*?\]', result, re.DOTALL)
             
-            if json_match:
+            # Convert to transaction format
+            transactions = []
+            for txn in transactions_data:
                 try:
-                    transactions_data = json.loads(json_match.group())
-                    if isinstance(transactions_data, dict) and "transactions" in transactions_data:
-                        transactions_data = transactions_data["transactions"]
+                    posted_date = txn.get("posted_date", "")
+                    if not posted_date:
+                        continue
+                    amount = abs(float(txn.get("amount", 0)))
+                    if amount == 0:
+                        continue
+                    direction = txn.get("direction", "expense").lower()
+                    if direction not in ["expense", "income"]:
+                        direction = "expense"
+                    
+                    transactions.append({
+                        "posted_date": posted_date,
+                        "description_raw": txn.get("description_raw", "Unknown"),
+                        "merchant_guess": txn.get("merchant_guess", txn.get("description_raw", "Unknown")[:50]),
+                        "amount": round(amount, 2),
+                        "direction": direction,
+                        "category": "Uncategorized",
+                        "source": "statement_pdf",
+                        "confidence": 0.9
+                    })
                 except:
-                    st.warning("⚠️ Could not parse OpenAI response as JSON. Using fallback extraction.")
-                    return extract_transactions_from_text(pdf_text)
-            else:
-                st.warning("⚠️ Could not parse OpenAI response as JSON. Using fallback extraction.")
-                return extract_transactions_from_text(pdf_text)
-        
-        # Convert to our transaction format
-        transactions = []
-        for txn in transactions_data:
-            try:
-                # Normalize date format
-                posted_date = txn.get("posted_date", "")
-                if not posted_date:
                     continue
-                
-                # Ensure amount is positive
-                amount = abs(float(txn.get("amount", 0)))
-                if amount == 0:
-                    continue
-                
-                direction = txn.get("direction", "expense").lower()
-                if direction not in ["expense", "income"]:
-                    # Infer from amount sign if present in original
-                    direction = "expense"
-                
-                transactions.append({
-                    "posted_date": posted_date,
-                    "description_raw": txn.get("description_raw", "Unknown"),
-                    "merchant_guess": txn.get("merchant_guess", txn.get("description_raw", "Unknown")[:50]),
-                    "amount": round(amount, 2),
-                    "direction": direction,
-                    "category": "Uncategorized",
-                    "source": "statement_pdf",
-                    "confidence": 0.9  # High confidence for AI-extracted transactions
-                })
-            except Exception as e:
-                continue
-        
-        return transactions
+            
+            return transactions
+            
+        finally:
+            # Clean up temporary file
+            if os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except:
+                    pass
         
     except Exception as e:
-        st.error(f"❌ Error extracting transactions with OpenAI: {str(e)}")
-        st.info("💡 Falling back to pattern-based extraction...")
-        return extract_transactions_from_text(pdf_text)
+        error_msg = str(e)
+        st.error(f"❌ Error extracting transactions with OpenAI: {error_msg}")
+        return []
 
 
 def extract_transactions_from_text(parsed_text: str) -> List[Dict]:
@@ -370,28 +434,35 @@ def extract_transactions_from_text(parsed_text: str) -> List[Dict]:
     return unique_transactions
 
 
-def categorize_transaction_openai(client: OpenAI, description: str, amount: float) -> tuple:
+def categorize_transaction_openai(client: OpenAI, description: str, amount: float, direction: str = "expense") -> tuple:
     """
     Use OpenAI to categorize a transaction.
     Returns (category, rationale).
+    For income transactions, just returns "Income". For expenses, categorizes into expense categories.
     """
     try:
-        prompt = f"""You are a financial assistant. Categorize this transaction into one of these categories:
+        # If it's income, just return "Income" (no subcategories)
+        if direction.lower() == "income":
+            return INCOME_CATEGORY, "Income transaction"
+        
+        # For expenses, categorize into expense categories
+        prompt = f"""You are a financial assistant. Categorize this expense transaction into one of these categories:
 {', '.join(EXPENSE_CATEGORIES)}
 
 Transaction: {description}
 Amount: ${amount:.2f}
+Type: Expense
 
 Respond in this exact format:
 CATEGORY: [category name]
 RATIONALE: [brief explanation]
 
-If the transaction doesn't fit any category well, use "Transfers"."""
+If the transaction doesn't fit any category well, use "Miscellaneous"."""
         
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are a helpful financial assistant that categorizes transactions."},
+                {"role": "system", "content": "You are a helpful financial assistant that categorizes expense transactions."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.3,
@@ -401,13 +472,14 @@ If the transaction doesn't fit any category well, use "Transfers"."""
         result = response.choices[0].message.content
         
         # Parse response
-        category = "Uncategorized"
+        category = "Miscellaneous"
         rationale = ""
         
         if "CATEGORY:" in result:
             category = result.split("CATEGORY:")[1].split("\n")[0].strip()
+            # Validate category is in expense categories
             if category not in EXPENSE_CATEGORIES:
-                category = "Uncategorized"
+                category = "Miscellaneous"
         
         if "RATIONALE:" in result:
             rationale = result.split("RATIONALE:")[1].strip()
@@ -415,7 +487,7 @@ If the transaction doesn't fit any category well, use "Transfers"."""
         return category, rationale
     except Exception as e:
         st.error(f"Error categorizing transaction: {str(e)}")
-        return "Uncategorized", ""
+        return "Miscellaneous" if direction.lower() == "expense" else INCOME_CATEGORY, ""
 
 
 def generate_financial_profile(client: OpenAI, df: pd.DataFrame) -> str:
@@ -446,22 +518,53 @@ Top Merchants:
 """
     
     try:
-        prompt = f"""Based on this financial summary, provide:
-1. 2-3 notable spending patterns you observe
-2. 2-3 practical, non-judgmental suggestions for improvement
+        # Build profile context if available
+        profile = st.session_state.user_profile
+        profile_context = ""
+        
+        if profile.get("age_range"):
+            profile_context += f"Age range: {profile['age_range']}. "
+        if profile.get("employment_status"):
+            profile_context += f"Employment: {profile['employment_status']}. "
+        if profile.get("occupation"):
+            profile_context += f"Occupation: {profile['occupation']}. "
+        if profile.get("location_country"):
+            location = profile['location_country']
+            if profile.get("location_city"):
+                location = f"{profile['location_city']}, {location}"
+            profile_context += f"Location: {location}. "
+        
+        # Always include profile context in recommendations
+        if not profile_context:
+            profile_context = "No profile information provided."
+        
+        prompt = f"""Based on this financial summary and user profile, provide personalized recommendations:
 
-Keep the tone practical and supportive.
+User Profile: {profile_context}
 
-{summary}"""
+Financial Summary:
+{summary}
+
+IMPORTANT: Always tailor your recommendations based on the user's profile information:
+- Age range: Adjust spending benchmarks and savings goals accordingly
+- Employment status: Consider income stability and budgeting advice
+- Location: Account for cost of living differences
+- Occupation: Consider industry-specific financial patterns
+
+Provide:
+1. 2-3 notable spending patterns you observe (personalized to their profile)
+2. 2-3 practical, non-judgmental suggestions for improvement (tailored to their situation)
+
+Keep the tone practical and supportive, and always reference their profile context when making recommendations."""
         
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are a helpful financial advisor that provides practical, non-judgmental advice."},
+                {"role": "system", "content": "You are a helpful financial advisor that provides practical, non-judgmental advice. Always personalize recommendations based on user profile information."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.7,
-            max_tokens=300
+            max_tokens=400
         )
         
         return response.choices[0].message.content
@@ -469,10 +572,135 @@ Keep the tone practical and supportive.
         return f"Error generating profile: {str(e)}"
 
 
-def get_chatbot_response(client: OpenAI, user_message: str, df: pd.DataFrame, profile: str) -> str:
+def detect_grocery_store_intent(user_message: str) -> tuple:
+    """
+    Detect if user is asking about grocery stores.
+    Returns (intent_type, store_name, location_from_message)
+    intent_type: 'grocery_store_recommendations', 'store_presence_check', or None
+    """
+    message_lower = user_message.lower()
+    
+    # Keywords for grocery store recommendations
+    recommendation_keywords = [
+        "store", "stores", "grocery", "groceries", "supermarket", "supermarkets",
+        "where to shop", "cheaper", "save", "savings", "prioritize", "recommend",
+        "options", "nearby", "local"
+    ]
+    
+    # Keywords for store presence check
+    presence_keywords = [
+        "is", "in", "near", "available", "have", "there", "exist"
+    ]
+    
+    has_recommendation = any(kw in message_lower for kw in recommendation_keywords)
+    has_presence = any(kw in message_lower for kw in presence_keywords)
+    
+    # Extract store name (common grocery chains)
+    common_stores = ["aldi", "walmart", "target", "kroger", "safeway", "whole foods", 
+                     "trader joe", "costco", "sam's club", "publix", "wegmans",
+                     "food lion", "stop & shop", "giant", "shoprite", "heb"]
+    
+    store_name = None
+    for store in common_stores:
+        if store in message_lower:
+            store_name = store.title()
+            break
+    
+    # Extract location from message (simple pattern: "in CITY" or "in CITY, STATE")
+    location_from_message = None
+    location_match = re.search(r'\bin\s+([A-Za-z\s]+(?:,\s*[A-Z]{2})?)', user_message, re.IGNORECASE)
+    if location_match:
+        location_from_message = location_match.group(1).strip()
+    
+    # Determine intent
+    if has_presence and store_name:
+        return ("store_presence_check", store_name, location_from_message)
+    elif has_recommendation:
+        return ("grocery_store_recommendations", store_name, location_from_message)
+    
+    return (None, None, None)
+
+
+def get_user_location() -> Dict[str, Optional[str]]:
+    """
+    Get user location from profile or session state.
+    Returns dict with country, city, state keys.
+    """
+    profile = st.session_state.user_profile
+    
+    location = {
+        "country": profile.get("location_country"),
+        "city": profile.get("location_city"),
+        "state": None  # We don't capture state separately, but can parse from city if needed
+    }
+    
+    # If location is in session state (from previous message), use it
+    if "last_location" in st.session_state:
+        location = st.session_state.last_location
+    
+    return location
+
+
+def validate_store_response(response: str, stores: List[Dict]) -> str:
+    """
+    Validate that LLM response doesn't hallucinate store names.
+    If it mentions stores not in the results, replace with safe fallback.
+    """
+    if not stores:
+        return response  # No stores to validate against
+    
+    # Extract store names from results
+    valid_store_names = {store["name"].lower() for store in stores}
+    
+    # Check if response mentions stores not in results
+    words = re.findall(r'\b[A-Z][a-z]+\b', response)
+    mentioned_stores = [w for w in words if w.lower() in valid_store_names or 
+                       any(store.lower() in w.lower() for store in ["aldi", "walmart", "target", "kroger", "safeway", "whole foods"])]
+    
+    # If response seems to mention stores but we have results, it's probably fine
+    # Only flag if response claims stores exist when we have no results
+    if not stores and any(store_kw in response.lower() for store_kw in ["store", "supermarket", "grocery"]):
+        return "I couldn't verify nearby stores via live lookup. Please try widening the search radius or provide a ZIP code."
+    
+    return response
+
+
+def get_chatbot_response(client: OpenAI, user_message: str, df: pd.DataFrame, profile: str) -> tuple:
     """
     Generate chatbot response with context from transactions and profile.
+    Returns (response_text, store_results) where store_results is None or a list of stores.
     """
+    # Check for grocery store intent
+    intent, store_name, location_from_message = detect_grocery_store_intent(user_message)
+    
+    store_results = None
+    location_used = None
+    
+    if intent:
+        # Get location
+        location = get_user_location()
+        
+        # If location found in message, parse it
+        if location_from_message:
+            # Try to parse "City, State" or just "City"
+            parts = [p.strip() for p in location_from_message.split(",")]
+            if len(parts) >= 1:
+                location["city"] = parts[0]
+            if len(parts) >= 2 and len(parts[1]) == 2:
+                location["state"] = parts[1]
+            st.session_state.last_location = location
+        
+        # Only proceed if we have at least country or city
+        if location.get("country") or location.get("city"):
+            # Fetch stores
+            store_results = get_nearby_grocery_stores(location, radius_km=10)
+            
+            # Filter by store name if specified
+            if store_name and store_results:
+                store_results = filter_stores_by_name(store_results, store_name)
+            
+            location_used = location
+    
     # Create context summary
     if df.empty:
         context = "No transaction data available."
@@ -481,24 +709,91 @@ def get_chatbot_response(client: OpenAI, user_message: str, df: pd.DataFrame, pr
         total_income = df[df['direction'] == 'income']['amount'].sum()
         spend_by_category = df[df['direction'] == 'expense'].groupby('category')['amount'].sum().to_dict()
         
+        # Always include user profile context (even if empty)
+        user_profile = st.session_state.user_profile
+        profile_info = "\nUser Profile: "
+        profile_parts = []
+        
+        if user_profile.get("age_range"):
+            profile_parts.append(f"Age {user_profile['age_range']}")
+        if user_profile.get("employment_status"):
+            profile_parts.append(f"Employment: {user_profile['employment_status']}")
+        if user_profile.get("occupation"):
+            profile_parts.append(f"Occupation: {user_profile['occupation']}")
+        if user_profile.get("location_country"):
+            loc = user_profile['location_country']
+            if user_profile.get("location_city"):
+                loc = f"{user_profile['location_city']}, {loc}"
+            profile_parts.append(f"Location: {loc}")
+        
+        if profile_parts:
+            profile_info += ", ".join(profile_parts) + "."
+        else:
+            profile_info += "No profile information available."
+        
         context = f"""
 Financial Context:
 - Total Expenses: ${total_expenses:,.2f}
 - Total Income: ${total_income:,.2f}
 - Spending by Category: {', '.join([f"{k}: ${v:,.2f}" for k, v in spend_by_category.items()])}
+{profile_info}
 
 Financial Profile:
 {profile if profile else "No profile generated yet."}
-"""
+
+IMPORTANT: Always use the user profile information above to personalize all recommendations. Consider their age, employment status, occupation, and location when providing financial advice."""
     
     try:
+        # Build system prompt with anti-hallucination guardrails and profile emphasis
+        system_prompt = """You are a helpful financial assistant. Answer questions based on the provided financial context and user profile. Be practical and supportive.
+
+CRITICAL REQUIREMENTS:
+1. ALWAYS personalize recommendations using the user profile information (age, employment, occupation, location)
+2. When answering questions about grocery stores or store locations:
+   - NEVER assume a store exists in a location without verification
+   - If store availability is needed, you MUST use the store_locator results provided
+   - If store_locator results are provided, use ONLY those stores in your answer
+   - Do not mention stores not in the provided list
+   - If no stores are found, say "I couldn't verify nearby stores via live lookup" and suggest widening radius or providing ZIP code
+   - Always include specific addresses when listing stores
+3. For all financial recommendations:
+   - Reference the user's age range when discussing savings goals or spending benchmarks
+   - Consider their employment status when giving budgeting advice
+   - Account for their location's cost of living when making spending comparisons
+   - Use their occupation to provide industry-relevant insights"""
+        
         # Build messages with system prompt and context
         messages = [
-            {"role": "system", "content": "You are a helpful financial assistant. Answer questions based on the provided financial context. Be practical and supportive."}
+            {"role": "system", "content": system_prompt}
         ]
         
         # Add context as first user message
         messages.append({"role": "user", "content": f"Here is my financial information:\n{context}\n\nPlease use this information to answer my questions."})
+        
+        # Add store results if available
+        if store_results is not None:
+            if store_results:
+                stores_text = "\n".join([
+                    f"- {store['name']}: {store['address']} ({store['distance_km']} km away)"
+                    for store in store_results
+                ])
+                
+                if intent == "store_presence_check":
+                    messages.append({
+                        "role": "user",
+                        "content": f"User asked: '{user_message}'\n\nStore lookup results for {location_used.get('city', location_used.get('country', 'location'))}:\n{stores_text}\n\nAnswer based ONLY on these results. If the store was not found, say so clearly."
+                    })
+                else:
+                    messages.append({
+                        "role": "user",
+                        "content": f"User asked about grocery stores to save money.\n\nNearby stores found (within 10 km):\n{stores_text}\n\nRecommend stores from this list only. Include addresses. Focus on stores known for lower prices."
+                    })
+            else:
+                loc_str = location_used.get('city') or location_used.get('country') or 'your location'
+                messages.append({
+                    "role": "user",
+                    "content": f"User asked about grocery stores.\n\nStore lookup returned no results for {loc_str}. Tell the user you couldn't verify nearby stores and suggest widening the search radius or providing a ZIP code."
+                })
         
         # Add chat history (last 4 exchanges = 8 messages max)
         for msg in st.session_state.chat_history[-8:]:
@@ -511,12 +806,17 @@ Financial Profile:
             model="gpt-3.5-turbo",
             messages=messages,
             temperature=0.7,
-            max_tokens=400
+            max_tokens=500
         )
         
-        return response.choices[0].message.content
+        response_text = response.choices[0].message.content
+        
+        # Validate response doesn't hallucinate stores
+        response_text = validate_store_response(response_text, store_results or [])
+        
+        return (response_text, store_results)
     except Exception as e:
-        return f"Error generating response: {str(e)}"
+        return (f"Error generating response: {str(e)}", None)
 
 
 # ============================================================================
@@ -525,8 +825,36 @@ Financial Profile:
 
 def home_page():
     """Home page with overview and API key setup."""
-    st.title("💰 Finance Assistant MVP")
+    st.title("💰 Accountable AI v1")
     st.markdown("Welcome to your personal finance assistant. Upload bank statements, categorize expenses, and get financial insights.")
+    
+    st.divider()
+    
+    # Profile Status
+    profile = st.session_state.user_profile
+    if not profile.get("profile_completed"):
+        st.info("👤 **Complete your profile** to get personalized financial insights! You can do this from Settings or click the button in the sidebar.")
+    else:
+        with st.expander("👤 View Profile", expanded=False):
+            col1, col2 = st.columns(2)
+            with col1:
+                if profile.get("age_range"):
+                    st.write(f"**Age Range:** {profile['age_range']}")
+                if profile.get("employment_status"):
+                    st.write(f"**Employment:** {profile['employment_status']}")
+            with col2:
+                if profile.get("occupation"):
+                    st.write(f"**Occupation:** {profile['occupation']}")
+                location = None
+                if profile.get("location_city") and profile.get("location_country"):
+                    location = f"{profile['location_city']}, {profile['location_country']}"
+                elif profile.get("location_country"):
+                    location = profile['location_country']
+                if location:
+                    st.write(f"**Location:** {location}")
+            if st.button("✏️ Edit Profile", use_container_width=True):
+                st.session_state.show_questionnaire = True
+                st.rerun()
     
     st.divider()
     
@@ -563,85 +891,404 @@ def home_page():
         st.info("👆 Upload a bank statement to get started!")
 
 
+def parse_csv_transactions(csv_file) -> List[Dict]:
+    """
+    Parse CSV file and extract transactions.
+    Tries to automatically detect date, description, and amount columns.
+    """
+    try:
+        # Read CSV
+        df = pd.read_csv(csv_file)
+        
+        if df.empty:
+            return []
+        
+        # Show CSV preview
+        with st.expander("View CSV Preview"):
+            st.dataframe(df.head(), use_container_width=True)
+        
+        # Try to identify columns automatically
+        date_col = None
+        desc_col = None
+        amount_col = None
+        
+        # Look for common column names
+        for col in df.columns:
+            col_lower = col.lower()
+            if not date_col and any(x in col_lower for x in ['date', 'posted', 'transaction_date']):
+                date_col = col
+            if not desc_col and any(x in col_lower for x in ['description', 'merchant', 'payee', 'details', 'memo', 'note']):
+                desc_col = col
+            if not amount_col and any(x in col_lower for x in ['amount', 'value', 'debit', 'credit', 'balance']):
+                amount_col = col
+        
+        # If not found, use first few columns as guesses
+        if not date_col and len(df.columns) > 0:
+            date_col = df.columns[0]
+        if not desc_col and len(df.columns) > 1:
+            desc_col = df.columns[1]
+        if not amount_col and len(df.columns) > 2:
+            amount_col = df.columns[2]
+        
+        # Let user select columns if auto-detection unclear
+        if not all([date_col, desc_col, amount_col]):
+            st.info("💡 Please select the columns for your CSV file:")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                date_col = st.selectbox("Date Column", options=df.columns.tolist(), index=0 if date_col else None)
+            with col2:
+                desc_col = st.selectbox("Description Column", options=df.columns.tolist(), index=1 if desc_col else None)
+            with col3:
+                amount_col = st.selectbox("Amount Column", options=df.columns.tolist(), index=2 if amount_col else None)
+        
+        # Extract transactions
+        transactions = []
+        for idx, row in df.iterrows():
+            try:
+                # Get date
+                date_val = str(row[date_col]) if date_col else ""
+                # Try to parse date
+                try:
+                    if pd.notna(date_val):
+                        # Try common date formats
+                        if '/' in date_val:
+                            parts = date_val.split('/')
+                            if len(parts) == 3:
+                                month, day, year = parts
+                                if len(year) == 2:
+                                    year = '20' + year
+                                posted_date = f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+                            else:
+                                posted_date = date_val
+                        elif '-' in date_val:
+                            posted_date = date_val
+                        else:
+                            posted_date = date_val
+                    else:
+                        continue
+                except:
+                    posted_date = date_val
+                
+                # Get description
+                description = str(row[desc_col]) if desc_col and pd.notna(row[desc_col]) else "Unknown"
+                
+                # Get amount
+                try:
+                    amount = abs(float(row[amount_col])) if amount_col and pd.notna(row[amount_col]) else 0
+                except:
+                    amount = 0
+                
+                if amount == 0:
+                    continue
+                
+                # Determine direction - positive amounts are usually income
+                direction = "expense"
+                if amount_col:
+                    try:
+                        amt_val = float(row[amount_col])
+                        if amt_val > 0:
+                            # Check column name for hints
+                            if 'credit' in str(amount_col).lower() or 'deposit' in str(amount_col).lower() or 'income' in str(amount_col).lower():
+                                direction = "income"
+                            elif 'debit' in str(amount_col).lower() or 'withdrawal' in str(amount_col).lower() or 'expense' in str(amount_col).lower():
+                                direction = "expense"
+                            else:
+                                # Default: positive amounts are usually income
+                                direction = "income"
+                        else:
+                            # Negative amounts are expenses
+                            direction = "expense"
+                    except:
+                        pass
+                else:
+                    # If no amount column, default to expense
+                    direction = "expense"
+                
+                # Merchant guess
+                merchant_guess = description[:50] if len(description) > 50 else description
+                
+                transactions.append({
+                    "posted_date": posted_date,
+                    "description_raw": description,
+                    "merchant_guess": merchant_guess,
+                    "amount": round(amount, 2),
+                    "direction": direction,
+                    "category": "Uncategorized",
+                    "source": "statement_csv",
+                    "confidence": 0.9
+                })
+            except Exception as e:
+                continue
+        
+        return transactions
+        
+    except Exception as e:
+        st.error(f"❌ Error parsing CSV: {str(e)}")
+        return []
+
+
 def upload_statement_page():
-    """Page for uploading and parsing bank statement PDFs."""
+    """Page for uploading and parsing bank statements (PDF or CSV)."""
     st.title("📄 Upload Bank Statement")
     
-    if not validate_openai_key():
-        st.warning("⚠️ Please set your OpenAI API key in the code (OPENAI_API_KEY constant) to enable PDF parsing.")
+    # If we have pending transactions, show classifier first and reset uploader
+    if not st.session_state.pending_transactions.empty:
+        show_transaction_review_ui()
         return
     
-    if not PDF_AVAILABLE:
-        st.warning("⚠️ PyPDF2 is not installed. Installing PDF parsing library...")
-        st.info("💡 Please run: pip install PyPDF2")
-        st.stop()
-    
+    # Use key so uploader resets after processing (avoids re-processing on rerun)
+    upload_key = st.session_state.get("upload_key", 0)
     uploaded_file = st.file_uploader(
-        "Upload Bank Statement PDF",
-        type=["pdf"],
-        help="Upload a PDF bank statement. The system will use OpenAI to extract transactions automatically."
+        "Upload Bank Statement (PDF or CSV)",
+        type=["pdf", "csv"],
+        help="Upload a PDF or CSV bank statement. PDFs will be processed with OpenAI, CSVs will be parsed directly.",
+        key=f"upload_{upload_key}"
     )
     
     if uploaded_file:
-        st.info("📝 Processing PDF with OpenAI... This may take a moment.")
+        file_type = uploaded_file.name.split('.')[-1].lower()
         
-        # Extract text from PDF
-        with st.spinner("Extracting text from PDF..."):
-            pdf_text = extract_text_from_pdf(uploaded_file)
+        if file_type == "pdf":
+            if not validate_openai_key():
+                st.warning("⚠️ Please set your OpenAI API key in the code (OPENAI_API_KEY constant) to enable PDF parsing.")
+                return
+            
+            st.info("📝 Processing PDF with OpenAI... This may take a moment.")
+            
+            # Extract transactions using OpenAI directly from PDF
+            client = get_openai_client()
+            with st.spinner("🤖 Using OpenAI to extract transactions from PDF (this may take 30-60 seconds)..."):
+                transactions = extract_transactions_from_pdf_with_openai(client, uploaded_file)
         
-        if not pdf_text or len(pdf_text.strip()) < 50:
-            st.error("❌ Could not extract text from PDF. Please check the file format.")
+        elif file_type == "csv":
+            st.info("📝 Processing CSV file...")
+            with st.spinner("Parsing CSV file..."):
+                transactions = parse_csv_transactions(uploaded_file)
+        
+        else:
+            st.error("❌ Unsupported file type. Please upload a PDF or CSV file.")
             return
         
-        st.success("✅ Text extracted from PDF!")
-        
-        # Show text preview (optional)
-        with st.expander("View Extracted Text (Preview)"):
-            st.text(pdf_text[:1000] + "..." if len(pdf_text) > 1000 else pdf_text)
-        
-        # Extract transactions using OpenAI
-        client = get_openai_client()
-        with st.spinner("🤖 Using OpenAI to extract transactions..."):
-            transactions = extract_transactions_with_openai(client, pdf_text)
-        
         if transactions:
-            st.success(f"✅ Extracted {len(transactions)} transactions using OpenAI!")
+            st.success(f"✅ Extracted {len(transactions)} transactions!")
             
             # Convert to DataFrame
             new_df = pd.DataFrame(transactions)
             
-            # Categorize transactions
+            # Auto-categorize transactions if OpenAI key is available (as suggestions)
             if validate_openai_key():
-                st.info("🤖 Categorizing transactions with AI...")
+                client = get_openai_client()
+                st.info("🤖 Generating category suggestions with AI...")
                 
                 progress_bar = st.progress(0)
                 for idx, row in new_df.iterrows():
                     category, rationale = categorize_transaction_openai(
                         client,
                         row['description_raw'],
-                        row['amount']
+                        row['amount'],
+                        row.get('direction', 'expense')
                     )
                     new_df.at[idx, 'category'] = category
                     progress_bar.progress((idx + 1) / len(new_df))
                 
-                st.success("✅ Transactions categorized!")
+                st.success("✅ Category suggestions generated!")
+            else:
+                st.info("💡 Set your OpenAI API key to get automatic category suggestions.")
             
-            # Update session state
+            # Store in pending transactions, bump upload key to reset uploader, then rerun
+            st.session_state.pending_transactions = new_df
+            st.session_state.review_index = 0
+            st.session_state.upload_key = st.session_state.get("upload_key", 0) + 1
+            st.rerun()
+        else:
+            # No transactions found
+            if file_type == "pdf":
+                st.warning("⚠️ No transactions found in the PDF. The PDF might not contain recognizable transaction data.")
+            elif file_type == "csv":
+                st.warning("⚠️ No transactions found in the CSV. Please check the file format.")
+
+
+def show_transaction_review_ui():
+    """Show UI for reviewing and approving transaction categories."""
+    pending_df = st.session_state.pending_transactions.copy()
+    current_idx = st.session_state.review_index
+    
+    if current_idx >= len(pending_df):
+        # All transactions reviewed, add remaining to database
+        if not pending_df.empty:
             if st.session_state.transactions.empty:
-                st.session_state.transactions = new_df
+                st.session_state.transactions = pending_df
             else:
                 st.session_state.transactions = pd.concat(
-                    [st.session_state.transactions, new_df],
+                    [st.session_state.transactions, pending_df],
                     ignore_index=True
                 )
-            
-            st.success(f"✅ Added {len(new_df)} transactions to your data!")
-            
-            # Show preview
-            st.subheader("📋 Extracted Transactions")
-            st.dataframe(new_df, use_container_width=True)
+            st.success(f"✅ Added {len(pending_df)} transactions to your data!")
+        
+        # Clear pending transactions
+        st.session_state.pending_transactions = pd.DataFrame()
+        st.session_state.review_index = 0
+        st.rerun()
+        return
+    
+    st.divider()
+    st.subheader("📝 Review & Categorize Transactions")
+    
+    # Progress indicator
+    progress_pct = (current_idx / len(pending_df)) * 100
+    st.progress(progress_pct / 100)
+    st.caption(f"Reviewing transaction {current_idx + 1} of {len(pending_df)}")
+    
+    # Get current transaction
+    current_txn = pending_df.iloc[current_idx]
+    
+    # Display transaction details
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.markdown("### Transaction Details")
+        st.markdown(f"**Date:** {current_txn['posted_date']}")
+        st.markdown(f"**Description:** {current_txn['description_raw']}")
+        st.markdown(f"**Merchant:** {current_txn['merchant_guess']}")
+        st.markdown(f"**Amount:** ${current_txn['amount']:,.2f}")
+        st.markdown(f"**Type:** {current_txn['direction'].title()}")
+    
+    with col2:
+        st.markdown("### Transaction Type")
+        current_direction = current_txn.get('direction', 'expense').lower()
+        is_income = current_direction == 'income'
+        
+        # Allow user to change direction
+        new_direction = st.radio(
+            "Transaction Type:",
+            ["Income", "Expense"],
+            index=1 if current_direction == 'expense' else 0,
+            horizontal=True
+        )
+        new_direction_lower = new_direction.lower()
+        
+        st.markdown("### Current Category")
+        current_category = current_txn.get('category', 'Uncategorized')
+        if current_category and current_category != 'Uncategorized':
+            st.info(f"💡 Suggested: **{current_category}**")
         else:
-            st.warning("⚠️ No transactions found in the PDF. The PDF might not contain recognizable transaction data.")
+            st.info("No suggestion")
+    
+    st.divider()
+    
+    # Category selection UI
+    st.markdown("### Select Category")
+    
+    # Determine which categories to show based on transaction direction
+    is_income = new_direction_lower == 'income'
+    if is_income:
+        # Income just uses "Income" category
+        available_categories = [INCOME_CATEGORY]
+        default_category = INCOME_CATEGORY
+    else:
+        available_categories = EXPENSE_CATEGORIES
+        default_category = "Miscellaneous"
+    
+    # Option 1: Select from predefined categories
+    category_option = st.radio(
+        "Category Selection Method:",
+        ["Select from predefined", "Type custom category", "Skip (leave blank)"],
+        horizontal=True
+    )
+    
+    selected_category = None
+    
+    if category_option == "Select from predefined":
+        # Show appropriate categories based on transaction type
+        if is_income:
+            # For income, just show "Income" option
+            category_options = ["", INCOME_CATEGORY, "Uncategorized"]
+            current_index = 1 if current_category == INCOME_CATEGORY else (2 if current_category == "Uncategorized" else 0)
+        else:
+            # For expenses, show expense categories
+            category_options = [""] + available_categories + ["Uncategorized"]
+            if current_category in available_categories:
+                current_index = available_categories.index(current_category) + 1
+            else:
+                current_index = 0
+        
+        selected_category = st.selectbox(
+            f"Choose a category ({'Income' if is_income else 'Expense'}):",
+            options=category_options,
+            index=current_index,
+            label_visibility="visible"
+        )
+        if selected_category == "":
+            selected_category = None
+    
+    elif category_option == "Type custom category":
+        # Allow typing custom category
+        custom_category = st.text_input(
+            "Enter custom category:",
+            value="" if current_category in EXPENSE_CATEGORIES or current_category == "Uncategorized" else current_category,
+            placeholder="e.g., Pet Care, Home Improvement"
+        )
+        selected_category = custom_category.strip() if custom_category.strip() else None
+    
+    else:  # Skip - leave blank
+        selected_category = ""  # Will be set to empty string, can be left blank
+    
+    # Action buttons
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        if st.button("✅ Approve & Next", type="primary", use_container_width=True):
+            # Update both direction and category
+            pending_df.at[pending_df.index[current_idx], 'direction'] = new_direction_lower
+            final_category = selected_category.strip() if selected_category and selected_category.strip() else ""
+            # If income and no category selected, default to "Income"
+            if new_direction_lower == 'income' and not final_category:
+                final_category = INCOME_CATEGORY
+            pending_df.at[pending_df.index[current_idx], 'category'] = final_category
+            st.session_state.pending_transactions = pending_df
+            st.session_state.review_index = current_idx + 1
+            st.rerun()
+    
+    with col2:
+        if st.button("⏭️ Skip This", use_container_width=True):
+            # Leave category as is and move to next (don't change it)
+            st.session_state.review_index = current_idx + 1
+            st.rerun()
+    
+    with col3:
+        if st.button("⏭️⏭️ Skip All Remaining", use_container_width=True):
+            # Add all remaining transactions with current categories
+            if st.session_state.transactions.empty:
+                st.session_state.transactions = pending_df
+            else:
+                st.session_state.transactions = pd.concat(
+                    [st.session_state.transactions, pending_df],
+                    ignore_index=True
+                )
+            st.success(f"✅ Added {len(pending_df)} transactions to your data!")
+            st.session_state.pending_transactions = pd.DataFrame()
+            st.session_state.review_index = 0
+            st.rerun()
+    
+    with col4:
+        if st.button("❌ Cancel", use_container_width=True):
+            # Clear pending transactions
+            st.session_state.pending_transactions = pd.DataFrame()
+            st.session_state.review_index = 0
+            st.info("Upload cancelled. No transactions were added.")
+            st.rerun()
+    
+    # Show preview of remaining transactions
+    with st.expander(f"📋 Preview Remaining Transactions ({len(pending_df) - current_idx - 1} left)"):
+        remaining_df = pending_df.iloc[current_idx + 1:].head(10)
+        if not remaining_df.empty:
+            st.dataframe(
+                remaining_df[['posted_date', 'description_raw', 'amount', 'direction', 'category']],
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("No more transactions to review.")
 
 
 def dashboard_page():
@@ -789,14 +1436,31 @@ def dashboard_page():
         
         if selected_idx is not None:
             actual_idx = transaction_indices[selected_idx]
-            current_category = filtered_df.iloc[selected_idx]['category']
+            selected_txn = filtered_df.iloc[selected_idx]
+            current_category = selected_txn['category']
+            is_income = selected_txn.get('direction', 'expense').lower() == 'income'
+            if is_income:
+                available_categories = [INCOME_CATEGORY]
+            else:
+                available_categories = EXPENSE_CATEGORIES
             
             col1, col2 = st.columns([3, 1])
             with col1:
+                # Determine default index
+                if is_income:
+                    category_options = [INCOME_CATEGORY, "Uncategorized"]
+                    default_index = 0 if current_category == INCOME_CATEGORY else 1
+                else:
+                    category_options = available_categories + ["Uncategorized"]
+                    if current_category in available_categories:
+                        default_index = available_categories.index(current_category)
+                    else:
+                        default_index = len(available_categories)  # Uncategorized
+                
                 new_category = st.selectbox(
-                    "New Category",
-                    options=EXPENSE_CATEGORIES + ["Uncategorized"],
-                    index=EXPENSE_CATEGORIES.index(current_category) if current_category in EXPENSE_CATEGORIES else len(EXPENSE_CATEGORIES)
+                    f"New Category ({'Income' if is_income else 'Expense'}):",
+                    options=category_options,
+                    index=default_index
                 )
             with col2:
                 st.write("")  # Spacing
@@ -856,18 +1520,47 @@ def chat_assistant_page():
         with st.chat_message("user"):
             st.write(user_input)
         
+        # Check if this is a grocery store query
+        intent, _, _ = detect_grocery_store_intent(user_input)
+        is_store_query = intent is not None
+        
         # Get assistant response
         with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                client = get_openai_client()
-                response = get_chatbot_response(
-                    client,
-                    user_input,
-                    st.session_state.transactions,
-                    st.session_state.financial_profile
-                )
-                st.write(response)
-                st.session_state.chat_history.append({"role": "assistant", "content": response})
+            if is_store_query:
+                with st.spinner("🔍 Looking up nearby stores..."):
+                    client = get_openai_client()
+                    response, store_results = get_chatbot_response(
+                        client,
+                        user_input,
+                        st.session_state.transactions,
+                        st.session_state.financial_profile
+                    )
+            else:
+                with st.spinner("Thinking..."):
+                    client = get_openai_client()
+                    response, store_results = get_chatbot_response(
+                        client,
+                        user_input,
+                        st.session_state.transactions,
+                        st.session_state.financial_profile
+                    )
+            
+            st.write(response)
+            
+            # Show store results in expandable section if available
+            if store_results and len(store_results) > 0:
+                with st.expander(f"📍 Store Locations ({len(store_results)} found)", expanded=False):
+                    st.markdown("**Top options near you (within 10 km):**")
+                    for i, store in enumerate(store_results[:5], 1):
+                        st.markdown(f"{i}. **{store['name']}**")
+                        st.markdown(f"   {store['address']}")
+                        st.markdown(f"   Distance: {store['distance_km']} km")
+                        if i < len(store_results[:5]):
+                            st.markdown("---")
+                    if len(store_results) > 5:
+                        st.markdown(f"\n*... and {len(store_results) - 5} more stores*")
+            
+            st.session_state.chat_history.append({"role": "assistant", "content": response})
     
     # Clear chat button
     if st.button("🗑️ Clear Chat History"):
@@ -879,16 +1572,200 @@ def chat_assistant_page():
 # Main App
 # ============================================================================
 
+def show_profile_questionnaire():
+    """Show the user profile questionnaire."""
+    st.title("👤 Complete Your Profile")
+    st.markdown("""
+    **Help us personalize your financial insights!**
+    
+    This information is used only to tailor recommendations and benchmarks to your situation. 
+    All fields are optional - you can skip this and complete it later in Settings.
+    """)
+    
+    st.divider()
+    
+    profile = st.session_state.user_profile.copy()
+    
+    # Age Range
+    age_ranges = ["", "18-24", "25-34", "35-44", "45-54", "55-64", "65+", "Prefer not to say"]
+    current_age_idx = age_ranges.index(profile.get("age_range", "")) if profile.get("age_range") in age_ranges else 0
+    age_range = st.selectbox(
+        "Age Range (optional):",
+        options=age_ranges,
+        index=current_age_idx,
+        help="Used to adjust spending benchmarks and savings recommendations"
+    )
+    profile["age_range"] = age_range if age_range else None
+    
+    # Employment Status
+    employment_options = ["", "Employed", "Self-employed", "Student", "Unemployed", "Retired", "Prefer not to say"]
+    current_emp_idx = employment_options.index(profile.get("employment_status", "")) if profile.get("employment_status") in employment_options else 0
+    employment_status = st.selectbox(
+        "Employment Status (optional):",
+        options=employment_options,
+        index=current_emp_idx,
+        help="Helps tailor financial advice to your situation"
+    )
+    profile["employment_status"] = employment_status if employment_status else None
+    
+    # Occupation/Industry
+    occupation = st.text_input(
+        "Occupation / Industry (optional):",
+        value=profile.get("occupation", "") or "",
+        placeholder="e.g., Software Engineer, Healthcare, Finance",
+        help="Used to provide industry-specific insights"
+    )
+    profile["occupation"] = occupation.strip() if occupation.strip() else None
+    
+    # Location
+    col1, col2 = st.columns(2)
+    with col1:
+        location_country = st.text_input(
+            "Country (optional):",
+            value=profile.get("location_country", "") or "",
+            placeholder="e.g., United States, Canada",
+            help="Used to adjust for cost of living differences"
+        )
+        profile["location_country"] = location_country.strip() if location_country.strip() else None
+    
+    with col2:
+        location_city = st.text_input(
+            "City (optional):",
+            value=profile.get("location_city", "") or "",
+            placeholder="e.g., New York, Toronto",
+            help="Provides more precise cost of living context"
+        )
+        profile["location_city"] = location_city.strip() if location_city.strip() else None
+    
+    st.divider()
+    
+    # Action buttons
+    col1, col2, col3 = st.columns([1, 1, 2])
+    with col1:
+        if st.button("💾 Save Profile", type="primary", use_container_width=True):
+            profile["profile_completed"] = True
+            st.session_state.user_profile = profile
+            st.success("✅ Profile saved!")
+            st.rerun()
+    
+    with col2:
+        if st.button("⏭️ Skip for Now", use_container_width=True):
+            st.session_state.user_profile = profile
+            st.info("You can complete your profile later in Settings.")
+            st.rerun()
+
+
+def settings_page():
+    """Settings page to view and edit user profile."""
+    st.title("⚙️ Settings")
+    
+    st.markdown("### 👤 User Profile")
+    st.markdown("Update your profile information to get personalized financial insights.")
+    
+    profile = st.session_state.user_profile.copy()
+    
+    # Show current profile status
+    if profile.get("profile_completed"):
+        st.success("✅ Profile completed")
+    else:
+        st.info("ℹ️ Profile not yet completed")
+    
+    st.divider()
+    
+    # Age Range
+    age_ranges = ["", "18-24", "25-34", "35-44", "45-54", "55-64", "65+", "Prefer not to say"]
+    current_age_idx = age_ranges.index(profile.get("age_range", "")) if profile.get("age_range") in age_ranges else 0
+    age_range = st.selectbox(
+        "Age Range:",
+        options=age_ranges,
+        index=current_age_idx
+    )
+    profile["age_range"] = age_range if age_range else None
+    
+    # Employment Status
+    employment_options = ["", "Employed", "Self-employed", "Student", "Unemployed", "Retired", "Prefer not to say"]
+    current_emp_idx = employment_options.index(profile.get("employment_status", "")) if profile.get("employment_status") in employment_options else 0
+    employment_status = st.selectbox(
+        "Employment Status:",
+        options=employment_options,
+        index=current_emp_idx
+    )
+    profile["employment_status"] = employment_status if employment_status else None
+    
+    # Occupation/Industry
+    occupation = st.text_input(
+        "Occupation / Industry:",
+        value=profile.get("occupation", "") or "",
+        placeholder="e.g., Software Engineer, Healthcare, Finance"
+    )
+    profile["occupation"] = occupation.strip() if occupation.strip() else None
+    
+    # Location
+    col1, col2 = st.columns(2)
+    with col1:
+        location_country = st.text_input(
+            "Country:",
+            value=profile.get("location_country", "") or "",
+            placeholder="e.g., United States, Canada"
+        )
+        profile["location_country"] = location_country.strip() if location_country.strip() else None
+    
+    with col2:
+        location_city = st.text_input(
+            "City:",
+            value=profile.get("location_city", "") or "",
+            placeholder="e.g., New York, Toronto"
+        )
+        profile["location_city"] = location_city.strip() if location_city.strip() else None
+    
+    st.divider()
+    
+    # Save button
+    if st.button("💾 Save Profile", type="primary"):
+        profile["profile_completed"] = True
+        st.session_state.user_profile = profile
+        st.success("✅ Profile updated successfully!")
+        st.rerun()
+    
+    # Clear profile button
+    st.markdown("---")
+    if st.button("🗑️ Clear Profile", type="secondary"):
+        st.session_state.user_profile = {
+            "age_range": None,
+            "employment_status": None,
+            "occupation": None,
+            "location_country": None,
+            "location_city": None,
+            "profile_completed": False
+        }
+        st.success("✅ Profile cleared!")
+        st.rerun()
+
+
 def main():
     # Sidebar Navigation
-    st.sidebar.title("💰 Finance Assistant")
+    st.sidebar.title("💰 Accountable AI v1")
     st.sidebar.markdown("---")
     
     page = st.sidebar.radio(
         "Navigation",
-        ["Home", "Upload Statement", "Dashboard", "Chat Assistant"],
+        ["Home", "Upload Statement", "Dashboard", "Chat Assistant", "Settings"],
         label_visibility="collapsed"
     )
+    
+    # Show profile questionnaire on first visit (optional, non-blocking)
+    if not st.session_state.user_profile.get("profile_completed") and page != "Settings":
+        with st.sidebar:
+            st.markdown("---")
+            if st.button("👤 Complete Profile", use_container_width=True):
+                st.session_state.show_questionnaire = True
+    
+    # Show questionnaire if requested
+    if st.session_state.get("show_questionnaire", False):
+        show_profile_questionnaire()
+        if st.session_state.user_profile.get("profile_completed"):
+            st.session_state.show_questionnaire = False
+        return
     
     # Route to appropriate page
     if page == "Home":
@@ -899,6 +1776,8 @@ def main():
         dashboard_page()
     elif page == "Chat Assistant":
         chat_assistant_page()
+    elif page == "Settings":
+        settings_page()
 
 
 if __name__ == "__main__":
