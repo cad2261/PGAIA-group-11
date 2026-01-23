@@ -17,8 +17,23 @@ from store_locator import get_nearby_grocery_stores, filter_stores_by_name
 # ============================================================================
 # API Keys Configuration
 # ============================================================================
-# OpenAI API Key - Replace with your actual key
-OPENAI_API_KEY = "OPEN_API_KEY"  # Get your key from https://platform.openai.com/api-keys
+# OpenAI API Key - Check Streamlit secrets first, then fallback to hardcoded value
+def get_openai_api_key():
+    """Get OpenAI API key from Streamlit secrets or fallback to hardcoded value."""
+    try:
+        # Try to get from Streamlit secrets
+        if hasattr(st, 'secrets') and 'openai' in st.secrets and 'api_key' in st.secrets.openai:
+            return st.secrets.openai.api_key
+        # Also try direct access pattern
+        if hasattr(st, 'secrets') and 'OPENAI_API_KEY' in st.secrets:
+            return st.secrets.OPENAI_API_KEY
+    except Exception:
+        pass
+    
+    # Fallback to hardcoded value (for local development)
+    return "OPEN_API_KEY"
+
+OPENAI_API_KEY = get_openai_api_key()
 
 # Page configuration
 st.set_page_config(
@@ -87,7 +102,9 @@ def get_openai_client() -> Optional[OpenAI]:
     """Get OpenAI client if API key is available."""
     if not validate_openai_key():
         return None
-    return OpenAI(api_key=OPENAI_API_KEY)
+    # Get fresh key from secrets
+    key = get_openai_api_key()
+    return OpenAI(api_key=key)
 
 
 def extract_transactions_from_pdf_with_openai(client: OpenAI, pdf_file) -> List[Dict]:
@@ -861,10 +878,28 @@ def home_page():
     # API Key Status
     st.subheader("🔑 OpenAI API Key Status")
     if validate_openai_key():
-        st.success("✅ OpenAI API key is configured and ready to use!")
+        # Check if key is from secrets or hardcoded
+        key_source = "code"
+        try:
+            if hasattr(st, 'secrets') and (('openai' in st.secrets and 'api_key' in st.secrets.openai) or 'OPENAI_API_KEY' in st.secrets):
+                key_source = "Streamlit secrets"
+        except:
+            pass
+        st.success(f"✅ OpenAI API key is configured and ready to use! (from {key_source})")
     else:
-        st.warning("⚠️ OpenAI API key not set. Please set `OPENAI_API_KEY` in the code (line ~12) to use categorization and chatbot features.")
-        st.info("💡 Get your API key from: https://platform.openai.com/api-keys")
+        st.warning("⚠️ OpenAI API key not set.")
+        st.info("💡 **Set your API key in one of these ways:**")
+        st.markdown("""
+        1. **Streamlit Secrets** (recommended for production):
+           - Create `.streamlit/secrets.toml` file with:
+           ```toml
+           [openai]
+           api_key = "sk-your-key-here"
+           ```
+        2. **Code** (for local development):
+           - Update `OPENAI_API_KEY` in the code
+        """)
+        st.info("Get your API key from: https://platform.openai.com/api-keys")
     
     st.divider()
     
@@ -1486,7 +1521,7 @@ def chat_assistant_page():
     st.title("💬 Chat Assistant")
     
     if not validate_openai_key():
-        st.warning("⚠️ Please set your OpenAI API key in the code (OPENAI_API_KEY constant) to use the chat assistant.")
+        st.warning("⚠️ Please set your OpenAI API key in Streamlit secrets or in the code to use the chat assistant.")
         return
     
     if st.session_state.transactions.empty:
