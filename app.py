@@ -18,7 +18,7 @@ from store_locator import get_nearby_grocery_stores, filter_stores_by_name
 # API Keys Configuration
 # ============================================================================
 # OpenAI API Key - Replace with your actual key
-OPENAI_API_KEY = "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"  # Get your key from https://platform.openai.com/api-keys
+OPENAI_API_KEY = "OPEN_API_KEY"  # Get your key from https://platform.openai.com/api-keys
 
 # Page configuration
 st.set_page_config(
