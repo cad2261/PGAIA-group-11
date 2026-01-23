@@ -35,7 +35,7 @@ def get_openai_api_key():
         pass
     
     # Fallback to hardcoded value (for local development)
-    return "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"
+    return "OPENAI_API_KEY"
 
 OPENAI_API_KEY = get_openai_api_key()
 
