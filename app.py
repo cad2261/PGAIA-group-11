@@ -40,9 +40,25 @@ def get_openai_api_key():
 OPENAI_API_KEY = get_openai_api_key()
 
 # Page configuration
+# Try to use custom icon from assets folder, fallback to emoji
+import os
+icon_paths = [
+    os.path.join("assets", "logo.ico"),
+    os.path.join("assets", "logo.png"),
+    os.path.join("assets", "Logo.ico"),
+    os.path.join("assets", "Logo.png"),
+    os.path.join("assets", "icon.ico"),
+    os.path.join("assets", "icon.png"),
+]
+page_icon = "💰"  # Default emoji
+for icon_path in icon_paths:
+    if os.path.exists(icon_path):
+        page_icon = icon_path
+        break
+
 st.set_page_config(
     page_title="Accountable AI v1",
-    page_icon="💰",
+    page_icon=page_icon,
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -56,10 +72,14 @@ if "financial_profile" not in st.session_state:
     st.session_state.financial_profile = ""
 if "pending_transactions" not in st.session_state:
     st.session_state.pending_transactions = pd.DataFrame()
+if "show_upload_complete" not in st.session_state:
+    st.session_state.show_upload_complete = False
 if "review_index" not in st.session_state:
     st.session_state.review_index = 0
 if "upload_key" not in st.session_state:
     st.session_state.upload_key = 0
+if "page_navigated" not in st.session_state:
+    st.session_state.page_navigated = False
     if "user_profile" not in st.session_state:
         st.session_state.user_profile = {
             "age_range": None,
@@ -970,7 +990,14 @@ def home_page():
         with col4:
             st.metric("Categories", categories_used)
     else:
-        st.info("👆 Upload a bank statement to get started!")
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            if st.button("👆 Upload a bank statement to get started!", use_container_width=True, type="primary"):
+                # Navigate to Upload Statement tab
+                st.session_state.page = "Upload Statement"
+                st.session_state.page_navigated = True
+                st.rerun()
+                st.rerun()
 
 
 def parse_csv_transactions(csv_file) -> List[Dict]:
@@ -1109,9 +1136,91 @@ def parse_csv_transactions(csv_file) -> List[Dict]:
         return []
 
 
+def show_upload_complete_screen():
+    """Show 'all done' screen after successfully reviewing all transactions."""
+    # Get the transactions that were just added (from the main transactions dataframe)
+    df = st.session_state.transactions.copy()
+    
+    # If we have recent transactions, show summary of those
+    # Otherwise show overall summary
+    if df.empty:
+        st.info("No transactions to display.")
+        st.session_state.show_upload_complete = False
+        return
+    
+    st.markdown("---")
+    
+    # Success message with icon
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.markdown("""
+        <div style="text-align: center; padding: 2rem 0;">
+            <h1 style="font-size: 3rem; margin-bottom: 1rem;">✅</h1>
+            <h2 style="color: #4CAF50; margin-bottom: 1rem;">All Done!</h2>
+            <p style="font-size: 1.2rem; color: #666; margin-bottom: 2rem;">
+                Successfully processed your bank statement
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    # Summary statistics
+    st.markdown("### 📊 Summary")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        total_txns = len(df)
+        st.metric("Total Transactions", total_txns)
+    
+    with col2:
+        expenses = len(df[df['direction'] == 'expense'])
+        st.metric("Expenses", expenses)
+    
+    with col3:
+        income = len(df[df['direction'] == 'income'])
+        st.metric("Income", income)
+    
+    with col4:
+        total_amount = df['amount'].sum()
+        st.metric("Total Amount", f"${total_amount:,.2f}")
+    
+    st.markdown("---")
+    
+    # Action buttons
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        if st.button("📊 View Dashboard", type="primary", use_container_width=True):
+            st.session_state.show_upload_complete = False
+            st.session_state.page = "Dashboard"
+            st.session_state.page_navigated = True
+            st.rerun()
+    
+    with col2:
+        if st.button("🔄 Upload Another", use_container_width=True):
+            st.session_state.show_upload_complete = False
+            st.session_state.pending_transactions = pd.DataFrame()
+            st.session_state.upload_key = st.session_state.get("upload_key", 0) + 1
+            st.rerun()
+    
+    st.markdown("---")
+    
+    # Preview of transactions
+    with st.expander("👀 Preview Recent Transactions", expanded=False):
+        preview_df = df.tail(10)[['posted_date', 'description_raw', 'merchant_guess', 'amount', 'direction', 'category']]
+        st.dataframe(preview_df, use_container_width=True, hide_index=True)
+        if len(df) > 10:
+            st.caption(f"Showing last 10 of {len(df)} total transactions")
+
+
 def upload_statement_page():
     """Page for uploading and parsing bank statements (PDF or CSV)."""
     st.title("📄 Upload Bank Statement")
+    
+    # Show "all done" screen if review was just completed
+    if st.session_state.get("show_upload_complete", False):
+        show_upload_complete_screen()
+        return
     
     # If we have pending transactions, show classifier first and reset uploader
     if not st.session_state.pending_transactions.empty:
@@ -1177,7 +1286,7 @@ def upload_statement_page():
             else:
                 st.info("💡 Set your OpenAI API key to get automatic category suggestions.")
             
-            # Store in pending transactions, bump upload key to reset uploader, then rerun
+            # Store in pending transactions, bump upload key to reset uploader
             st.session_state.pending_transactions = new_df
             st.session_state.review_index = 0
             st.session_state.upload_key = st.session_state.get("upload_key", 0) + 1
@@ -1190,12 +1299,121 @@ def upload_statement_page():
                 st.warning("⚠️ No transactions found in the CSV. Please check the file format.")
 
 
+def clean_merchant_name(merchant: str, description: str = "") -> str:
+    """
+    Clean up merchant name by removing common prefixes/suffixes and extra whitespace.
+    Fallback function when OpenAI API is not available.
+    """
+    if not merchant:
+        merchant = description
+    
+    # Remove common prefixes
+    prefixes = ["PAYMENT TO ", "PAYMENT - ", "DEBIT CARD PURCHASE ", "ACH DEBIT ", 
+                "ACH CREDIT ", "ONLINE PAYMENT ", "ELECTRONIC PAYMENT ", "CHECK ",
+                "AUTOMATIC PAYMENT ", "RECURRING PAYMENT ", "BILL PAY "]
+    for prefix in prefixes:
+        if merchant.upper().startswith(prefix):
+            merchant = merchant[len(prefix):].strip()
+    
+    # Remove common suffixes
+    suffixes = [" #", " -", " *", " POS", " ONLINE", " MOBILE"]
+    for suffix in suffixes:
+        if suffix in merchant.upper():
+            idx = merchant.upper().find(suffix)
+            merchant = merchant[:idx].strip()
+    
+    # Remove extra whitespace and clean up
+    merchant = ' '.join(merchant.split())
+    
+    # Truncate if too long
+    if len(merchant) > 50:
+        merchant = merchant[:47] + "..."
+    
+    return merchant.strip() if merchant.strip() else "Unknown"
+
+
+def clean_merchant_name_openai(client: OpenAI, merchant: str, description: str = "") -> str:
+    """
+    Use OpenAI API to clean and standardize merchant names.
+    Returns a clean, standardized merchant name (e.g., "Amazon" instead of "AMAZON.COM #1234").
+    Falls back to simple cleaning if API call fails.
+    """
+    if not merchant:
+        merchant = description
+    
+    if not merchant or merchant.strip() == "Unknown":
+        return "Unknown"
+    
+    # Check cache first to avoid repeated API calls
+    cache_key = f"merchant_clean_{merchant}_{description}"
+    if cache_key in st.session_state:
+        return st.session_state[cache_key]
+    
+    try:
+        prompt = f"""You are a financial assistant. Clean and standardize this merchant name from a bank transaction.
+
+Raw merchant/description: "{merchant}"
+Full transaction description: "{description}"
+
+Return ONLY a clean, standardized merchant name. Examples:
+- "AMAZON.COM #1234" → "Amazon"
+- "DEBIT CARD PURCHASE STARBUCKS STORE" → "Starbucks"
+- "PAYMENT TO WALMART SUPERCENTER" → "Walmart"
+- "ACH DEBIT NETFLIX.COM" → "Netflix"
+
+Rules:
+- Remove payment prefixes (PAYMENT TO, DEBIT CARD PURCHASE, ACH DEBIT, etc.)
+- Remove transaction IDs, reference numbers, and suffixes (#, POS, ONLINE, etc.)
+- Return the actual business/merchant name only
+- Keep it short (max 30 characters)
+- Use proper capitalization (e.g., "Amazon", "Walmart", "Starbucks")
+- If unclear, return the most likely merchant name
+
+Return ONLY the cleaned merchant name, nothing else."""
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a helpful financial assistant that standardizes merchant names from bank transactions."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=50
+        )
+        
+        cleaned = response.choices[0].message.content.strip()
+        
+        # Remove quotes if present
+        cleaned = cleaned.strip('"\'')
+        
+        # Truncate if too long
+        if len(cleaned) > 50:
+            cleaned = cleaned[:47] + "..."
+        
+        # Cache the result
+        st.session_state[cache_key] = cleaned
+        return cleaned if cleaned else clean_merchant_name(merchant, description)
+        
+    except Exception as e:
+        # Fall back to simple cleaning if API fails
+        return clean_merchant_name(merchant, description)
+
+
 def show_transaction_review_ui():
     """Show UI for reviewing and approving transaction categories."""
     pending_df = st.session_state.pending_transactions.copy()
     current_idx = st.session_state.review_index
     
     if current_idx >= len(pending_df):
+        # All transactions reviewed, clean any remaining merchant names with OpenAI before saving
+        client = get_openai_client()
+        if client and validate_openai_key():
+            for idx in pending_df.index:
+                original_merchant = pending_df.at[idx, 'merchant_guess']
+                description = pending_df.at[idx, 'description_raw']
+                cleaned = clean_merchant_name_openai(client, original_merchant, description)
+                pending_df.at[idx, 'merchant_guess'] = cleaned
+        
         # All transactions reviewed, add remaining to database
         if not pending_df.empty:
             if st.session_state.transactions.empty:
@@ -1205,11 +1423,11 @@ def show_transaction_review_ui():
                     [st.session_state.transactions, pending_df],
                     ignore_index=True
                 )
-            st.success(f"✅ Added {len(pending_df)} transactions to your data!")
         
-        # Clear pending transactions
+        # Clear pending transactions and show success screen
         st.session_state.pending_transactions = pd.DataFrame()
         st.session_state.review_index = 0
+        st.session_state.show_upload_complete = True
         st.rerun()
         return
     
@@ -1315,31 +1533,109 @@ def show_transaction_review_ui():
     else:  # Skip - leave blank
         selected_category = ""  # Will be set to empty string, can be left blank
     
+    st.divider()
+    
+    # Merchant name editing UI
+    st.markdown("### Edit Merchant Name")
+    
+    # Get original merchant_guess from transaction (this is what we'll keep if user skips)
+    original_merchant_guess = current_txn.get('merchant_guess', '')
+    description_raw = current_txn.get('description_raw', '')
+    
+    # Clean up the merchant name using OpenAI API for better suggestion
+    cleaned_merchant = None
+    client = get_openai_client()
+    if client and validate_openai_key():
+        with st.spinner("Cleaning merchant name..."):
+            cleaned_merchant = clean_merchant_name_openai(client, original_merchant_guess, description_raw)
+    else:
+        # Fallback to simple cleaning if OpenAI is not available
+        cleaned_merchant = clean_merchant_name(original_merchant_guess, description_raw)
+    
+    # Show suggested merchant name (cleaned up version)
+    st.info(f"💡 Suggested: **{cleaned_merchant}**")
+    
+    # Option 1: Keep suggested merchant
+    merchant_option = st.radio(
+        "Merchant Name:",
+        ["Keep suggested", "Edit merchant name", "Skip (leave as is)"],
+        horizontal=True
+    )
+    
+    selected_merchant = None
+    
+    if merchant_option == "Keep suggested":
+        selected_merchant = cleaned_merchant
+    
+    elif merchant_option == "Edit merchant name":
+        # Allow typing custom merchant name
+        custom_merchant = st.text_input(
+            "Enter merchant name:",
+            value=cleaned_merchant,
+            placeholder="e.g., Amazon, Walmart, Starbucks",
+            help="Enter a clean, short merchant name (max 50 characters)"
+        )
+        selected_merchant = custom_merchant.strip() if custom_merchant.strip() else cleaned_merchant
+        # Truncate if too long
+        if len(selected_merchant) > 50:
+            selected_merchant = selected_merchant[:47] + "..."
+    
+    else:  # Skip - leave as is
+        selected_merchant = original_merchant_guess  # Keep the original merchant_guess value from the transaction
+    
     # Action buttons
     st.markdown('<div class="txn-actions">', unsafe_allow_html=True)
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
         if st.button("✅ Approve & Next", type="primary", use_container_width=True, key="txn_approve_next"):
-            # Update both direction and category
+            # Update direction, category, and merchant
             pending_df.at[pending_df.index[current_idx], 'direction'] = new_direction_lower
             final_category = selected_category.strip() if selected_category and selected_category.strip() else ""
             # If income and no category selected, default to "Income"
             if new_direction_lower == 'income' and not final_category:
                 final_category = INCOME_CATEGORY
             pending_df.at[pending_df.index[current_idx], 'category'] = final_category
+            # Update merchant name
+            if selected_merchant:
+                pending_df.at[pending_df.index[current_idx], 'merchant_guess'] = selected_merchant
+            else:
+                # If merchant was skipped, still try to clean it with OpenAI API
+                client = get_openai_client()
+                if client and validate_openai_key():
+                    original_merchant = pending_df.at[pending_df.index[current_idx], 'merchant_guess']
+                    description = pending_df.at[pending_df.index[current_idx], 'description_raw']
+                    cleaned = clean_merchant_name_openai(client, original_merchant, description)
+                    pending_df.at[pending_df.index[current_idx], 'merchant_guess'] = cleaned
             st.session_state.pending_transactions = pending_df
             st.session_state.review_index = current_idx + 1
             st.rerun()
     
     with col2:
         if st.button("⏭️ Skip This", use_container_width=True, key="txn_skip_one"):
-            # Leave category as is and move to next (don't change it)
+            # Leave category as is, but still clean merchant name with OpenAI if available
+            client = get_openai_client()
+            if client and validate_openai_key():
+                original_merchant = pending_df.at[pending_df.index[current_idx], 'merchant_guess']
+                description = pending_df.at[pending_df.index[current_idx], 'description_raw']
+                cleaned = clean_merchant_name_openai(client, original_merchant, description)
+                pending_df.at[pending_df.index[current_idx], 'merchant_guess'] = cleaned
+                st.session_state.pending_transactions = pending_df
             st.session_state.review_index = current_idx + 1
             st.rerun()
     
     with col3:
         if st.button("⏭️⏭️ Skip All Remaining", use_container_width=True, key="txn_skip_all"):
+            # Clean all remaining merchant names with OpenAI before saving
+            client = get_openai_client()
+            if client and validate_openai_key():
+                with st.spinner("Cleaning merchant names for remaining transactions..."):
+                    for idx in pending_df.index:
+                        original_merchant = pending_df.at[idx, 'merchant_guess']
+                        description = pending_df.at[idx, 'description_raw']
+                        cleaned = clean_merchant_name_openai(client, original_merchant, description)
+                        pending_df.at[idx, 'merchant_guess'] = cleaned
+            
             # Add all remaining transactions with current categories
             if st.session_state.transactions.empty:
                 st.session_state.transactions = pending_df
@@ -1348,9 +1644,10 @@ def show_transaction_review_ui():
                     [st.session_state.transactions, pending_df],
                     ignore_index=True
                 )
-            st.success(f"✅ Added {len(pending_df)} transactions to your data!")
+            # Clear pending transactions and show success screen
             st.session_state.pending_transactions = pd.DataFrame()
             st.session_state.review_index = 0
+            st.session_state.show_upload_complete = True
             st.rerun()
     
     with col4:
@@ -2466,18 +2763,13 @@ def apply_custom_theme():
         }
         
         /* ==========================
-           Chat input (st.chat_input)
+           Chat input (st.chat_input) - SCOPED TO CHAT ASSISTANT ONLY
            ========================== */
         
-        /* Outer chat input wrapper (the dark bar) */
-        [data-testid="stChatInput"],
-        [data-testid="stChatInput"] > div,
-        [data-testid="stChatInput"] div[data-baseweb="textarea"] {
-            background-color: #FFFFFF !important;
-            border-top: 1px solid #E0E0E0 !important;
-        }
+        /* Only apply these styles when Chat Assistant page is active */
+        /* This is handled via JavaScript detection */
         
-        /* The actual textarea */
+        /* The actual textarea - general styling */
         [data-testid="stChatInput"] textarea,
         [data-testid="stChatInput"] textarea:focus {
             background-color: #F5F5F5 !important;
@@ -2561,35 +2853,115 @@ def apply_custom_theme():
         }
         // Also run after Streamlit reruns
         window.addEventListener('load', styleCompleteProfileButton);
-        function fixChatInputBar() {
-            const chat = document.querySelector('[data-testid="stChatInput"]');
-            if (!chat) return;
+        function isChatAssistantPage() {
+            // Check if we're on the Chat Assistant page by looking for the page title
+            const pageTitle = document.querySelector('h1, h2, [data-testid="stHeader"]');
+            if (pageTitle) {
+                const titleText = pageTitle.textContent || pageTitle.innerText || '';
+                return titleText.includes('Chat Assistant') || titleText.includes('💬');
+            }
+            return false;
+        }
+        
+        function fixChatAssistantBottomBar() {
+            // Only run on Chat Assistant page
+            if (!isChatAssistantPage()) {
+                return;
+            }
             
-            chat.style.setProperty('background-color', '#FFFFFF', 'important');
-            chat.style.setProperty('border-top', '1px solid #E0E0E0', 'important');
+            // Target the sticky bottom container (Streamlit's stBottom)
+            const bottomContainers = [
+                document.querySelector('section[data-testid="stBottom"]'),
+                document.querySelector('div[data-testid="stBottom"]'),
+                document.querySelector('footer[data-testid="stFooter"]'),
+                document.querySelector('[data-testid="stChatInput"]')?.closest('section'),
+                document.querySelector('[data-testid="stChatInput"]')?.closest('div[style*="position"]'),
+            ].filter(Boolean);
             
-            const inner = chat.querySelectorAll('div, section');
-            inner.forEach(el => {
-                el.style.setProperty('background-color', '#FFFFFF', 'important');
+            bottomContainers.forEach(container => {
+                if (container) {
+                    container.style.setProperty('background-color', '#FFFFFF', 'important');
+                    container.style.setProperty('background', '#FFFFFF', 'important');
+                    container.style.setProperty('border-top', '1px solid #E0E0E0', 'important');
+                    
+                    // Force white on all immediate children
+                    Array.from(container.children).forEach(child => {
+                        child.style.setProperty('background-color', '#FFFFFF', 'important');
+                        child.style.setProperty('background', '#FFFFFF', 'important');
+                    });
+                }
             });
+            
+            // Target chat input container specifically
+            const chat = document.querySelector('[data-testid="stChatInput"]');
+            if (chat) {
+                chat.style.setProperty('background-color', '#FFFFFF', 'important');
+                chat.style.setProperty('background', '#FFFFFF', 'important');
+                chat.style.setProperty('border-top', '1px solid #E0E0E0', 'important');
+                
+                // Force white on all nested elements
+                const allElements = chat.querySelectorAll('*');
+                allElements.forEach(el => {
+                    const computedBg = window.getComputedStyle(el).backgroundColor;
+                    // Only change if it's dark/black
+                    if (computedBg && (computedBg.includes('rgb(0, 0, 0') || computedBg.includes('rgba(0, 0, 0') || computedBg === 'black' || computedBg === '#000000' || computedBg.includes('rgb(18,') || computedBg.includes('rgb(19,'))) {
+                        el.style.setProperty('background-color', '#FFFFFF', 'important');
+                        el.style.setProperty('background', '#FFFFFF', 'important');
+                    }
+                });
+            }
+            
+            // Target any fixed/sticky positioned elements near the bottom (likely the sticky footer)
+            const allElements = document.querySelectorAll('*');
+            allElements.forEach(el => {
+                const rect = el.getBoundingClientRect();
+                const computedStyle = window.getComputedStyle(el);
+                const position = computedStyle.position;
+                
+                // Only check fixed/sticky elements near the bottom of the page
+                if ((position === 'fixed' || position === 'sticky') && rect.bottom > window.innerHeight - 150) {
+                    const computedBg = computedStyle.backgroundColor;
+                    if (computedBg && (computedBg.includes('rgb(0, 0, 0') || computedBg.includes('rgba(0, 0, 0') || computedBg === 'black' || computedBg === '#000000' || computedBg.includes('rgb(18,') || computedBg.includes('rgb(19,'))) {
+                        el.style.setProperty('background-color', '#FFFFFF', 'important');
+                        el.style.setProperty('background', '#FFFFFF', 'important');
+                        el.style.setProperty('border-top', '1px solid #E0E0E0', 'important');
+                    }
+                }
+            });
+        }
+        
+        function fixChatInputBar() {
+            // General chat input fix (for all pages, but lighter)
+            const chat = document.querySelector('[data-testid="stChatInput"]');
+            if (chat) {
+                chat.style.setProperty('border-top', '1px solid #E0E0E0', 'important');
+            }
         }
         
         // Use MutationObserver to catch dynamic updates
         const observer = new MutationObserver(function() {
             styleCompleteProfileButton();
             fixChatInputBar();
+            fixChatAssistantBottomBar(); // Scoped to Chat Assistant only
         });
         if (document.body) {
             observer.observe(document.body, { childList: true, subtree: true });
         }
         
-        // Also call fixChatInputBar on load and after Streamlit updates
+        // Also call functions on load and after Streamlit updates
         if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', fixChatInputBar);
+            document.addEventListener('DOMContentLoaded', function() {
+                fixChatInputBar();
+                fixChatAssistantBottomBar();
+            });
         } else {
             fixChatInputBar();
+            fixChatAssistantBottomBar();
         }
-        window.addEventListener('load', fixChatInputBar);
+        window.addEventListener('load', function() {
+            fixChatInputBar();
+            fixChatAssistantBottomBar();
+        });
         
         // Function to harmonize grey boxes and elements
         function harmonizeGreyBoxes() {
@@ -2916,11 +3288,46 @@ def main():
     display_logo()
     st.sidebar.markdown("---")
     
+    # Initialize page in session state if not set
+    if "page" not in st.session_state:
+        st.session_state.page = "Home"
+    
+    # Get current page from session state (this is the source of truth)
+    current_page = st.session_state.page
+    
+    # Determine index for radio button based on session state
+    page_options = ["Home", "Upload Statement", "Dashboard", "Chat Assistant", "Settings"]
+    try:
+        current_index = page_options.index(current_page)
+    except ValueError:
+        current_index = 0
+        st.session_state.page = "Home"
+        current_page = "Home"
+    
+    # Always render the radio button to prevent it from disappearing
+    # Check if we just navigated programmatically (before clearing the flag)
+    was_navigated = st.session_state.get("page_navigated", False)
+    if was_navigated:
+        st.session_state.page_navigated = False
+    
+    # Always render the radio button
     page = st.sidebar.radio(
         "Navigation",
-        ["Home", "Upload Statement", "Dashboard", "Chat Assistant", "Settings"],
+        page_options,
+        index=current_index,
         label_visibility="collapsed"
     )
+    
+    # Only update session state if:
+    # 1. Radio button value changed AND
+    # 2. We didn't just navigate programmatically (to prevent overwriting)
+    if page != current_page and not was_navigated:
+        st.session_state.page = page
+        st.rerun()
+    elif was_navigated:
+        # If we navigated programmatically, ensure page matches session state
+        # This prevents the radio button from overriding our programmatic navigation
+        page = current_page
     
     # Show profile questionnaire on first visit (optional, non-blocking)
     if not st.session_state.user_profile.get("profile_completed") and page != "Settings":
@@ -2938,16 +3345,17 @@ def main():
             st.session_state.show_questionnaire = False
         return
     
-    # Route to appropriate page
-    if page == "Home":
+    # Route to appropriate page (use session_state.page to allow programmatic navigation)
+    current_page = st.session_state.get("page", page)
+    if current_page == "Home":
         home_page()
-    elif page == "Upload Statement":
+    elif current_page == "Upload Statement":
         upload_statement_page()
-    elif page == "Dashboard":
+    elif current_page == "Dashboard":
         dashboard_page()
-    elif page == "Chat Assistant":
+    elif current_page == "Chat Assistant":
         chat_assistant_page()
-    elif page == "Settings":
+    elif current_page == "Settings":
         settings_page()
 
 
