@@ -2,7 +2,11 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import plotly.io as pio
 from datetime import datetime
+
+# Set global Plotly default template to light theme
+pio.templates.default = "plotly_white"
 from openai import OpenAI
 import io
 import re
@@ -31,7 +35,7 @@ def get_openai_api_key():
         pass
     
     # Fallback to hardcoded value (for local development)
-    return "OPEN_API_KEY"
+    return "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"
 
 OPENAI_API_KEY = get_openai_api_key()
 
@@ -56,15 +60,16 @@ if "review_index" not in st.session_state:
     st.session_state.review_index = 0
 if "upload_key" not in st.session_state:
     st.session_state.upload_key = 0
-if "user_profile" not in st.session_state:
-    st.session_state.user_profile = {
-        "age_range": None,
-        "employment_status": None,
-        "occupation": None,
-        "location_country": None,
-        "location_city": None,
-        "profile_completed": False
-    }
+    if "user_profile" not in st.session_state:
+        st.session_state.user_profile = {
+            "age_range": None,
+            "employment_status": None,
+            "occupation": None,
+            "location_country": None,
+            "location_city": None,
+            "location_zip": None,
+            "profile_completed": False
+        }
 if "show_questionnaire" not in st.session_state:
     st.session_state.show_questionnaire = False
 if "last_location" not in st.session_state:
@@ -92,6 +97,24 @@ INCOME_CATEGORY = "Income"
 # ============================================================================
 # Helper Functions
 # ============================================================================
+
+def apply_plotly_light_theme(fig):
+    """Apply light theme to Plotly charts: white background, dark text, light gridlines."""
+    fig.update_layout(
+        template="plotly_white",
+        paper_bgcolor="#FFFFFF",
+        plot_bgcolor="#FFFFFF",
+        font=dict(color="#111111"),
+        legend=dict(
+            bgcolor="rgba(0,0,0,0)",
+            bordercolor="rgba(0,0,0,0)"
+        ),
+        margin=dict(l=20, r=20, t=50, b=20)
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="#E6E6E6", zeroline=False)
+    fig.update_yaxes(showgrid=True, gridcolor="#E6E6E6", zeroline=False)
+    return fig
+
 
 def validate_openai_key() -> bool:
     """Check if OpenAI API key is set."""
@@ -641,14 +664,15 @@ def detect_grocery_store_intent(user_message: str) -> tuple:
 def get_user_location() -> Dict[str, Optional[str]]:
     """
     Get user location from profile or session state.
-    Returns dict with country, city, state keys.
+    Returns dict with country, city, state, zip keys.
     """
     profile = st.session_state.user_profile
     
     location = {
         "country": profile.get("location_country"),
         "city": profile.get("location_city"),
-        "state": None  # We don't capture state separately, but can parse from city if needed
+        "state": None,  # We don't capture state separately, but can parse from city if needed
+        "zip": profile.get("location_zip")
     }
     
     # If location is in session state (from previous message), use it
@@ -842,7 +866,24 @@ CRITICAL REQUIREMENTS:
 
 def home_page():
     """Home page with overview and API key setup."""
-    st.title("💰 Accountable AI v1")
+    # Display logo in header if available
+    import os
+    logo_paths = [
+        os.path.join("assets", "logo.svg"),
+        os.path.join("assets", "logo.png"),
+        os.path.join("assets", "Logo.svg"),
+        os.path.join("assets", "Logo.png"),
+    ]
+    
+    logo_found = False
+    for logo_path in logo_paths:
+        if os.path.exists(logo_path):
+            st.image(logo_path, width=250)
+            logo_found = True
+            break
+    
+    if not logo_found:
+        st.title("💰 Accountable AI v1")
     st.markdown("Welcome to your personal finance assistant. Upload bank statements, categorize expenses, and get financial insights.")
     
     st.divider()
@@ -865,8 +906,14 @@ def home_page():
                 location = None
                 if profile.get("location_city") and profile.get("location_country"):
                     location = f"{profile['location_city']}, {profile['location_country']}"
+                    if profile.get("location_zip"):
+                        location = f"{location} {profile['location_zip']}"
                 elif profile.get("location_country"):
                     location = profile['location_country']
+                    if profile.get("location_zip"):
+                        location = f"{location} {profile['location_zip']}"
+                elif profile.get("location_zip"):
+                    location = profile['location_zip']
                 if location:
                     st.write(f"**Location:** {location}")
             if st.button("✏️ Edit Profile", use_container_width=True):
@@ -1269,10 +1316,11 @@ def show_transaction_review_ui():
         selected_category = ""  # Will be set to empty string, can be left blank
     
     # Action buttons
+    st.markdown('<div class="txn-actions">', unsafe_allow_html=True)
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        if st.button("✅ Approve & Next", type="primary", use_container_width=True):
+        if st.button("✅ Approve & Next", type="primary", use_container_width=True, key="txn_approve_next"):
             # Update both direction and category
             pending_df.at[pending_df.index[current_idx], 'direction'] = new_direction_lower
             final_category = selected_category.strip() if selected_category and selected_category.strip() else ""
@@ -1285,13 +1333,13 @@ def show_transaction_review_ui():
             st.rerun()
     
     with col2:
-        if st.button("⏭️ Skip This", use_container_width=True):
+        if st.button("⏭️ Skip This", use_container_width=True, key="txn_skip_one"):
             # Leave category as is and move to next (don't change it)
             st.session_state.review_index = current_idx + 1
             st.rerun()
     
     with col3:
-        if st.button("⏭️⏭️ Skip All Remaining", use_container_width=True):
+        if st.button("⏭️⏭️ Skip All Remaining", use_container_width=True, key="txn_skip_all"):
             # Add all remaining transactions with current categories
             if st.session_state.transactions.empty:
                 st.session_state.transactions = pending_df
@@ -1306,12 +1354,13 @@ def show_transaction_review_ui():
             st.rerun()
     
     with col4:
-        if st.button("❌ Cancel", use_container_width=True):
+        if st.button("❌ Cancel", use_container_width=True, key="txn_cancel"):
             # Clear pending transactions
             st.session_state.pending_transactions = pd.DataFrame()
             st.session_state.review_index = 0
             st.info("Upload cancelled. No transactions were added.")
             st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
     
     # Show preview of remaining transactions
     with st.expander(f"📋 Preview Remaining Transactions ({len(pending_df) - current_idx - 1} left)"):
@@ -1382,6 +1431,19 @@ def dashboard_page():
                 names=category_totals.index,
                 title="Expense Distribution"
             )
+            fig.update_layout(
+                template="plotly_white",
+                paper_bgcolor="#FFFFFF",
+                plot_bgcolor="#FFFFFF",
+                font=dict(color="#000000"),
+                title=dict(font=dict(color="#000000")),
+            )
+            fig.update_traces(
+                textfont=dict(color="#000000"),
+                textposition='auto',
+                textinfo='label+percent'
+            )
+            fig.update_layout(legend=dict(font=dict(color="#000000")))
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("No expense data to display.")
@@ -1399,7 +1461,23 @@ def dashboard_page():
                 title="Top Expense Categories",
                 labels={'x': 'Amount ($)', 'y': 'Category'}
             )
-            fig.update_layout(yaxis={'categoryorder': 'total ascending'})
+            fig.update_layout(
+                yaxis={'categoryorder': 'total ascending'},
+                template="plotly_white",
+                paper_bgcolor="#FFFFFF",
+                plot_bgcolor="#FFFFFF",
+                font=dict(color="#000000"),
+                title=dict(font=dict(color="#000000")),
+            )
+            fig.update_xaxes(
+                tickfont=dict(color="#000000"),
+                title=dict(font=dict(color="#000000"))
+            )
+            fig.update_yaxes(
+                tickfont=dict(color="#000000"),
+                title=dict(font=dict(color="#000000")),
+                tickmode='linear'
+            )
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("No expense data to display.")
@@ -1417,6 +1495,15 @@ def dashboard_page():
             labels={'x': 'Merchant', 'y': 'Amount ($)'}
         )
         fig.update_xaxes(tickangle=45)
+        fig.update_layout(
+            template="plotly_white",
+            paper_bgcolor="#FFFFFF",
+            plot_bgcolor="#FFFFFF",
+            font=dict(color="#000000"),
+            title=dict(font=dict(color="#000000")),
+        )
+        fig.update_xaxes(tickfont=dict(color="#000000"), title=dict(font=dict(color="#000000")))
+        fig.update_yaxes(tickfont=dict(color="#000000"), title=dict(font=dict(color="#000000")))
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("No expense data to display.")
@@ -1653,7 +1740,7 @@ def show_profile_questionnaire():
     profile["occupation"] = occupation.strip() if occupation.strip() else None
     
     # Location
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
         location_country = st.text_input(
             "Country (optional):",
@@ -1671,6 +1758,15 @@ def show_profile_questionnaire():
             help="Provides more precise cost of living context"
         )
         profile["location_city"] = location_city.strip() if location_city.strip() else None
+    
+    with col3:
+        location_zip = st.text_input(
+            "ZIP Code (optional):",
+            value=profile.get("location_zip", "") or "",
+            placeholder="e.g., 10001, M5H 2N2",
+            help="Used to refine store locator searches"
+        )
+        profile["location_zip"] = location_zip.strip() if location_zip.strip() else None
     
     st.divider()
     
@@ -1736,7 +1832,7 @@ def settings_page():
     profile["occupation"] = occupation.strip() if occupation.strip() else None
     
     # Location
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
         location_country = st.text_input(
             "Country:",
@@ -1753,6 +1849,14 @@ def settings_page():
         )
         profile["location_city"] = location_city.strip() if location_city.strip() else None
     
+    with col3:
+        location_zip = st.text_input(
+            "ZIP Code:",
+            value=profile.get("location_zip", "") or "",
+            placeholder="e.g., 10001, M5H 2N2"
+        )
+        profile["location_zip"] = location_zip.strip() if location_zip.strip() else None
+    
     st.divider()
     
     # Save button
@@ -1762,24 +1866,1054 @@ def settings_page():
         st.success("✅ Profile updated successfully!")
         st.rerun()
     
-    # Clear profile button
-    st.markdown("---")
-    if st.button("🗑️ Clear Profile", type="secondary"):
-        st.session_state.user_profile = {
-            "age_range": None,
-            "employment_status": None,
-            "occupation": None,
-            "location_country": None,
-            "location_city": None,
-            "profile_completed": False
+
+
+def display_logo():
+    """Display logo from assets folder if it exists."""
+    import os
+    logo_paths = [
+        os.path.join("assets", "logo.svg"),
+        os.path.join("assets", "logo.png"),
+        os.path.join("assets", "Logo.svg"),
+        os.path.join("assets", "Logo.png"),
+    ]
+    
+    for logo_path in logo_paths:
+        if os.path.exists(logo_path):
+            st.sidebar.image(logo_path, use_container_width=True)
+            return
+    
+    # If no logo found, show emoji as fallback
+    st.sidebar.markdown("### 💰 Accountable AI v1")
+
+
+def apply_custom_theme():
+    """Apply custom color scheme: white main background, light blue sidebar."""
+    st.markdown("""
+        <style>
+        /* Theme variables */
+        :root {
+            --bg-main: #FFFFFF;
+            --bg-surface: #F5F5F5;
+            --bg-surface-2: #E8E8E8;
+            --border: #E0E0E0;
+            --text-main: #111111;
+            --primary: #4CAF50;
+            --primary-hover: #45a049;
+            --danger: #FF4B4B;
+            --danger-hover: #FF3030;
         }
-        st.success("✅ Profile cleared!")
-        st.rerun()
+        
+        /* Main app background - white */
+        .stApp {
+            background-color: #FFFFFF !important;
+        }
+        
+        /* Main content area background - white */
+        .main .block-container {
+            background-color: #FFFFFF !important;
+            padding-top: 2rem;
+        }
+        
+        /* All text on white background - black */
+        .main *,
+        .stMarkdown,
+        .stText,
+        h1, h2, h3, h4, h5, h6,
+        p, span, div,
+        .element-container,
+        .stDataFrame,
+        .stMetric {
+            color: #000000 !important;
+        }
+        
+        /* Layer A: CSS guardrails - Fix dark BaseWeb buttons only, preserve gray alerts */
+        /* BaseWeb / Streamlit button surfaces that show up dark */
+        button[kind],
+        .stButton button,
+        [data-testid="baseButton-primary"],
+        [data-testid="baseButton-secondary"],
+        [data-testid="baseButton-tertiary"] {
+            background-color: var(--bg-surface) !important;
+            color: var(--text-main) !important;
+            border: 1px solid var(--border) !important;
+        }
+        
+        .stButton button:hover {
+            background-color: var(--bg-surface-2) !important;
+        }
+        
+        /* Preserve semantic buttons */
+        .stButton button.btn-primary,
+        button.btn-primary,
+        button[kind="primary"] {
+            background-color: var(--primary) !important;
+            color: #fff !important;
+            border-color: var(--primary) !important;
+        }
+        
+        .stButton button.btn-primary:hover,
+        button.btn-primary:hover,
+        button[kind="primary"]:hover {
+            background-color: var(--primary-hover) !important;
+            border-color: var(--primary-hover) !important;
+        }
+        
+        .stButton button.btn-danger,
+        button.btn-danger {
+            background-color: var(--danger) !important;
+            color: #fff !important;
+            border-color: var(--danger) !important;
+        }
+        
+        .stButton button.btn-danger:hover,
+        button.btn-danger:hover {
+            background-color: var(--danger-hover) !important;
+            border-color: var(--danger-hover) !important;
+        }
+        
+        /* Layer B: Dark-only override class */
+        .no-dark-surface {
+            background-color: var(--bg-surface) !important;
+            color: var(--text-main) !important;
+            border-color: var(--border) !important;
+        }
+        
+        .no-dark-surface * {
+            color: var(--text-main) !important;
+            background: transparent !important;
+        }
+        
+        /* Exception: preserve semantic button colors even with no-dark-surface */
+        .no-dark-surface.btn-primary,
+        .no-dark-surface.btn-danger {
+            background-color: inherit !important;
+            color: inherit !important;
+        }
+        
+        /* Sidebar background - light blue */
+        [data-testid="stSidebar"] {
+            background-color: #E3F2FD !important;
+        }
+        
+        /* Sidebar content sections */
+        [data-testid="stSidebar"] > div {
+            background-color: #E3F2FD !important;
+        }
+        
+        /* Sidebar markdown and text elements */
+        [data-testid="stSidebar"] .stMarkdown,
+        [data-testid="stSidebar"] .stText {
+            background-color: #E3F2FD !important;
+        }
+        
+        /* Ensure proper contrast for sidebar text */
+        [data-testid="stSidebar"] * {
+            color: #262730 !important;
+        }
+        
+        /* Header and title areas */
+        .stHeader {
+            background-color: #FFFFFF !important;
+        }
+        
+        /* Complete Profile button - light green (like success/ready color) */
+        .complete-profile-button-container ~ div button[kind="secondary"],
+        [data-testid="stSidebar"] button[kind="secondary"] {
+            background-color: #4CAF50 !important;
+            color: #FFFFFF !important;
+            border-color: #4CAF50 !important;
+        }
+        
+        .complete-profile-button-container ~ div button[kind="secondary"]:hover,
+        [data-testid="stSidebar"] button[kind="secondary"]:hover {
+            background-color: #45a049 !important;
+            border-color: #45a049 !important;
+        }
+        
+        /* Danger button styling - destructive actions (e.g., Clear Profile) */
+        .btn-danger,
+        .btn-danger[kind="secondary"],
+        .btn-danger[data-baseweb="button"],
+        button.btn-danger {
+            background-color: #FF4B4B !important;
+            border-color: #FF4B4B !important;
+            color: #FFFFFF !important;
+            background: #FF4B4B !important;
+        }
+        
+        .btn-danger:hover,
+        .btn-danger[kind="secondary"]:hover,
+        .btn-danger[data-baseweb="button"]:hover,
+        button.btn-danger:hover {
+            background-color: #FF3030 !important;
+            border-color: #FF3030 !important;
+            background: #FF3030 !important;
+        }
+        
+        /* Force white text on nested elements */
+        .btn-danger *,
+        .btn-danger div,
+        .btn-danger span,
+        .btn-danger svg,
+        button.btn-danger *,
+        button.btn-danger div,
+        button.btn-danger span,
+        button.btn-danger svg {
+            color: #FFFFFF !important;
+            fill: #FFFFFF !important;
+        }
+        
+        /* Ensure nested button children don't keep dark backgrounds */
+        .btn-danger > div,
+        .btn-danger > div > div,
+        .btn-danger[data-baseweb="button"] > div,
+        button.btn-danger > div,
+        button.btn-danger > div > div,
+        button.btn-danger[data-baseweb="button"] > div {
+            background-color: transparent !important;
+            background: transparent !important;
+        }
+        
+        /* Override BaseWeb button component styles */
+        .btn-danger[data-baseweb="button"] > div > div,
+        button.btn-danger[data-baseweb="button"] > div > div {
+            background-color: transparent !important;
+            background: transparent !important;
+            color: #FFFFFF !important;
+        }
+        
+        /* Transaction action buttons styling */
+        .txn-actions button {
+            height: 44px !important;
+            border-radius: 12px !important;
+            font-weight: 600 !important;
+            transition: all 0.2s ease !important;
+        }
+        
+        /* Default secondary style for transaction action buttons */
+        .txn-actions button[kind="secondary"],
+        .txn-actions button:not(.btn-primary):not(.btn-danger) {
+            background-color: #F5F5F5 !important;
+            border: 1px solid #E0E0E0 !important;
+            color: #111111 !important;
+        }
+        
+        .txn-actions button[kind="secondary"]:hover,
+        .txn-actions button:not(.btn-primary):not(.btn-danger):hover {
+            background-color: #E8E8E8 !important;
+            border-color: #D0D0D0 !important;
+        }
+        
+        /* Primary button in transaction actions */
+        .txn-actions .btn-primary,
+        .txn-actions button.btn-primary {
+            background-color: #4CAF50 !important;
+            border-color: #4CAF50 !important;
+            color: #FFFFFF !important;
+        }
+        
+        .txn-actions .btn-primary:hover,
+        .txn-actions button.btn-primary:hover {
+            background-color: #45a049 !important;
+            border-color: #45a049 !important;
+        }
+        
+        /* Danger button in transaction actions */
+        .txn-actions .btn-danger,
+        .txn-actions button.btn-danger {
+            background-color: #FF4B4B !important;
+            border-color: #FF4B4B !important;
+            color: #FFFFFF !important;
+        }
+        
+        .txn-actions .btn-danger:hover,
+        .txn-actions button.btn-danger:hover {
+            background-color: #FF3030 !important;
+            border-color: #FF3030 !important;
+        }
+        
+        /* Ensure nested elements inherit correct colors */
+        .txn-actions button *,
+        .txn-actions button div,
+        .txn-actions button span,
+        .txn-actions button svg {
+            color: inherit !important;
+            fill: inherit !important;
+        }
+        
+        .txn-actions .btn-primary *,
+        .txn-actions .btn-primary div,
+        .txn-actions .btn-primary span,
+        .txn-actions .btn-primary svg {
+            color: #FFFFFF !important;
+            fill: #FFFFFF !important;
+        }
+        
+        .txn-actions .btn-danger *,
+        .txn-actions .btn-danger div,
+        .txn-actions .btn-danger span,
+        .txn-actions .btn-danger svg {
+            color: #FFFFFF !important;
+            fill: #FFFFFF !important;
+        }
+        
+        /* Settings input boxes - lighter background for white theme */
+        .stTextInput > div > div > input,
+        .stSelectbox > div > div > select,
+        .stNumberInput > div > div > input,
+        input[type="text"],
+        input[type="number"],
+        input[type="email"],
+        input[type="password"],
+        select {
+            background-color: #F5F5F5 !important;
+            border-color: #E0E0E0 !important;
+            color: #000000 !important;
+        }
+        
+        .stTextInput > div > div > input:focus,
+        .stSelectbox > div > div > select:focus,
+        .stNumberInput > div > div > input:focus,
+        input[type="text"]:focus,
+        input[type="number"]:focus,
+        input[type="email"]:focus,
+        input[type="password"]:focus,
+        select:focus {
+            background-color: #FAFAFA !important;
+            border-color: #4CAF50 !important;
+            box-shadow: 0 0 0 1px #4CAF50 !important;
+            outline: none !important;
+        }
+        
+        /* Style the input containers (BaseWeb components) */
+        [data-baseweb="input"],
+        [data-baseweb="select"] {
+            background-color: #F5F5F5 !important;
+        }
+        
+        [data-baseweb="input"] input,
+        [data-baseweb="select"] select {
+            background-color: #F5F5F5 !important;
+            color: #000000 !important;
+        }
+        
+        [data-baseweb="input"]:focus-within,
+        [data-baseweb="select"]:focus-within {
+            background-color: #FAFAFA !important;
+        }
+        
+        /* Selectbox dropdowns - match text input styling */
+        .stSelectbox > div > div,
+        [data-baseweb="select"] > div {
+            background-color: #F5F5F5 !important;
+        }
+        
+        .stSelectbox > div > div > div,
+        [data-baseweb="select"] > div > div {
+            background-color: #F5F5F5 !important;
+            color: #000000 !important;
+        }
+        
+        /* Selectbox dropdown menu options */
+        [data-baseweb="popover"] [role="listbox"],
+        [data-baseweb="popover"] [role="option"],
+        div[data-baseweb="select"] + div [role="listbox"],
+        div[data-baseweb="select"] + div [role="option"] {
+            background-color: #F5F5F5 !important;
+            color: #000000 !important;
+        }
+        
+        [data-baseweb="popover"] [role="option"]:hover,
+        div[data-baseweb="select"] + div [role="option"]:hover {
+            background-color: #E0E0E0 !important;
+        }
+        
+        /* File uploader - lighter background like text inputs - entire container */
+        .stFileUploader,
+        [data-testid="stFileUploader"],
+        .stFileUploader > div,
+        [data-testid="stFileUploader"] > div,
+        .stFileUploader > div > div,
+        [data-testid="stFileUploader"] > div > div,
+        .stFileUploader > div > div > div,
+        [data-testid="stFileUploader"] > div > div > div,
+        [data-baseweb="file-uploader"],
+        [data-baseweb="file-uploader"] > div,
+        [data-baseweb="file-uploader"] > div > div,
+        [data-baseweb="file-uploader"] > div > div > div {
+            background-color: #F5F5F5 !important;
+            border-color: #E0E0E0 !important;
+            color: #000000 !important;
+        }
+        
+        /* File uploader drag and drop area - all nested elements */
+        [data-baseweb="file-uploader"] *,
+        .stFileUploader *,
+        [data-testid="stFileUploader"] * {
+            background-color: #F5F5F5 !important;
+            color: #000000 !important;
+        }
+        
+        /* Override for specific elements that need different styling */
+        [data-baseweb="file-uploader"] button,
+        [data-baseweb="file-uploader"] [role="button"],
+        .stFileUploader button {
+            background-color: #F5F5F5 !important;
+            border-color: #E0E0E0 !important;
+            color: #000000 !important;
+        }
+        
+        /* Text elements in file uploader */
+        [data-baseweb="file-uploader"] p,
+        [data-baseweb="file-uploader"] span,
+        [data-baseweb="file-uploader"] div,
+        .stFileUploader p,
+        .stFileUploader span,
+        .stFileUploader div {
+            color: #000000 !important;
+        }
+        
+        /* File uploader browse button - lighter background */
+        [data-baseweb="file-uploader"] button,
+        [data-baseweb="file-uploader"] [role="button"],
+        [data-baseweb="file-uploader"] [data-baseweb="button"],
+        .stFileUploader button,
+        [data-testid="stFileUploader"] button,
+        [data-baseweb="file-uploader"] > div > button,
+        [data-baseweb="file-uploader"] > div > div > button,
+        [data-baseweb="file-uploader"] > div > div > div > button {
+            background-color: #F5F5F5 !important;
+            border-color: #E0E0E0 !important;
+            color: #000000 !important;
+        }
+        
+        [data-baseweb="file-uploader"] button:hover,
+        [data-baseweb="file-uploader"] [role="button"]:hover,
+        [data-baseweb="file-uploader"] [data-baseweb="button"]:hover,
+        .stFileUploader button:hover,
+        [data-testid="stFileUploader"] button:hover {
+            background-color: #E0E0E0 !important;
+            border-color: #BDBDBD !important;
+        }
+        
+        /* BaseWeb button component within file uploader */
+        [data-baseweb="file-uploader"] [data-baseweb="button"] > div,
+        [data-baseweb="file-uploader"] [data-baseweb="button"] > div > div {
+            background-color: #F5F5F5 !important;
+            color: #000000 !important;
+        }
+        
+        /* File input element styling */
+        input[type="file"],
+        input[type="file"]::-webkit-file-upload-button {
+            background-color: #F5F5F5 !important;
+            border-color: #E0E0E0 !important;
+            color: #000000 !important;
+        }
+        
+        /* Target all file uploader children and nested elements */
+        [data-baseweb="file-uploader"] *,
+        .stFileUploader *,
+        [data-testid="stFileUploader"] * {
+            color: #000000 !important;
+        }
+        
+        /* Specifically target the browse button text/span */
+        [data-baseweb="file-uploader"] button span,
+        [data-baseweb="file-uploader"] [role="button"] span,
+        .stFileUploader button span {
+            color: #000000 !important;
+        }
+        
+        /* Input wrapper backgrounds */
+        .stTextInput > div,
+        .stSelectbox > div,
+        .stNumberInput > div {
+            background-color: transparent !important;
+        }
+        
+        /* Harmonize info/warning/error boxes - lighter backgrounds */
+        .stAlert,
+        [data-testid="stAlert"],
+        div[data-baseweb="notification"],
+        div[data-baseweb="toast"] {
+            background-color: #F5F5F5 !important;
+            border-color: #E0E0E0 !important;
+            color: #000000 !important;
+        }
+        
+        /* Info boxes - light blue tint */
+        .stAlert[data-baseweb="notification-info"],
+        div[data-baseweb="notification"][data-kind="info"],
+        [data-testid="stAlert"]:has([data-icon="info"]),
+        [data-testid="stAlert"]:has(div[data-icon="info"]) {
+            background-color: #E3F2FD !important;
+            border-color: #BBDEFB !important;
+            color: #000000 !important;
+        }
+        
+        /* Warning boxes - light yellow/amber tint */
+        .stAlert[data-baseweb="notification-warning"],
+        div[data-baseweb="notification"][data-kind="warning"],
+        [data-testid="stAlert"]:has([data-icon="warning"]),
+        [data-testid="stAlert"]:has(div[data-icon="warning"]) {
+            background-color: #FFF3E0 !important;
+            border-color: #FFE0B2 !important;
+            color: #000000 !important;
+        }
+        
+        /* Error boxes - light red/pink tint */
+        .stAlert[data-baseweb="notification-error"],
+        div[data-baseweb="notification"][data-kind="error"],
+        [data-testid="stAlert"]:has([data-icon="error"]),
+        [data-testid="stAlert"]:has(div[data-icon="error"]) {
+            background-color: #FFEBEE !important;
+            border-color: #FFCDD2 !important;
+            color: #000000 !important;
+        }
+        
+        /* Success boxes - light green tint (lighter than before) */
+        .stAlert[data-baseweb="notification-success"],
+        div[data-baseweb="notification"][data-kind="success"],
+        [data-testid="stAlert"]:has([data-icon="success"]),
+        [data-testid="stAlert"]:has(div[data-icon="success"]) {
+            background-color: #E8F5E9 !important;
+            border-color: #C8E6C9 !important;
+            color: #000000 !important;
+        }
+        
+        /* Target alert content directly */
+        [data-baseweb="notification"] > div,
+        [data-testid="stAlert"] > div {
+            color: #000000 !important;
+        }
+        
+        /* Expanders - lighter background */
+        .streamlit-expanderHeader,
+        [data-testid="stExpander"] > div:first-child {
+            background-color: #F5F5F5 !important;
+            color: #000000 !important;
+        }
+        
+        .streamlit-expanderContent,
+        [data-testid="stExpander"] > div:last-child {
+            background-color: #FAFAFA !important;
+        }
+        
+        /* Metrics - lighter background */
+        [data-testid="stMetricContainer"],
+        [data-testid="stMetricValue"],
+        [data-testid="stMetricLabel"] {
+            background-color: #F5F5F5 !important;
+            color: #000000 !important;
+        }
+        
+        /* DataFrames and tables - lighter backgrounds */
+        .stDataFrame,
+        [data-testid="stDataFrame"],
+        table {
+            background-color: #FFFFFF !important;
+        }
+        
+        .stDataFrame thead,
+        [data-testid="stDataFrame"] thead,
+        table thead {
+            background-color: #F5F5F5 !important;
+            color: #000000 !important;
+        }
+        
+        .stDataFrame tbody tr:nth-child(even),
+        [data-testid="stDataFrame"] tbody tr:nth-child(even),
+        table tbody tr:nth-child(even) {
+            background-color: #FAFAFA !important;
+        }
+        
+        .stDataFrame tbody tr:nth-child(odd),
+        [data-testid="stDataFrame"] tbody tr:nth-child(odd),
+        table tbody tr:nth-child(odd) {
+            background-color: #FFFFFF !important;
+        }
+        
+        /* Cards and containers - lighter grey */
+        .element-container,
+        [data-testid="element-container"] {
+            background-color: transparent !important;
+        }
+        
+        /* Radio buttons and other form elements */
+        .stRadio > div,
+        .stCheckbox > div,
+        .stSlider > div {
+            background-color: transparent !important;
+        }
+        
+        /* Progress bars and spinners - lighter */
+        .stProgress > div > div {
+            background-color: #E0E0E0 !important;
+        }
+        
+        .stProgress > div > div > div {
+            background-color: #4CAF50 !important;
+        }
+        
+        /* Orange person icon in Complete Profile button */
+        .profile-icon-orange {
+            color: #FF9800 !important;
+            font-size: 1.2em !important;
+            display: inline-block !important;
+            vertical-align: middle !important;
+        }
+        
+        /* ==========================
+           Chat input (st.chat_input)
+           ========================== */
+        
+        /* Outer chat input wrapper (the dark bar) */
+        [data-testid="stChatInput"],
+        [data-testid="stChatInput"] > div,
+        [data-testid="stChatInput"] div[data-baseweb="textarea"] {
+            background-color: #FFFFFF !important;
+            border-top: 1px solid #E0E0E0 !important;
+        }
+        
+        /* The actual textarea */
+        [data-testid="stChatInput"] textarea,
+        [data-testid="stChatInput"] textarea:focus {
+            background-color: #F5F5F5 !important;
+            color: #000000 !important;
+            border: 1px solid #E0E0E0 !important;
+            box-shadow: none !important;
+        }
+        
+        /* Placeholder text */
+        [data-testid="stChatInput"] textarea::placeholder {
+            color: #666666 !important;
+            opacity: 1 !important;
+        }
+        
+        /* Send button container */
+        [data-testid="stChatInput"] button {
+            background-color: #F5F5F5 !important;
+            border: 1px solid #E0E0E0 !important;
+            color: #000000 !important;
+        }
+        
+        /* Send button hover */
+        [data-testid="stChatInput"] button:hover {
+            background-color: #E0E0E0 !important;
+            border-color: #BDBDBD !important;
+        }
+        </style>
+        <script>
+        function styleCompleteProfileButton() {
+            const sidebar = document.querySelector('[data-testid="stSidebar"]');
+            if (sidebar) {
+                const buttons = sidebar.querySelectorAll('button');
+                buttons.forEach(button => {
+                    const buttonText = button.textContent || button.innerText || '';
+                    if (buttonText.includes('Complete Profile') && !button.classList.contains('profile-btn-styled')) {
+                        // Mark as styled to avoid re-styling
+                        button.classList.add('profile-btn-styled');
+                        
+                        // Force light green background with !important
+                        button.style.setProperty('background-color', '#4CAF50', 'important');
+                        button.style.setProperty('color', '#FFFFFF', 'important');
+                        button.style.setProperty('border-color', '#4CAF50', 'important');
+                        button.style.setProperty('border', '1px solid #4CAF50', 'important');
+                        
+                        // Style the person icon to orange
+                        let buttonHTML = button.innerHTML || '';
+                        if (buttonHTML.includes('👤') && !buttonHTML.includes('profile-icon-orange')) {
+                            // Create a styled span for the orange icon
+                            buttonHTML = buttonHTML.replace(/👤/g, '<span class="profile-icon-orange" style="color: #FF9800 !important; font-size: 1.2em; display: inline-block; vertical-align: middle;">👤</span>');
+                            button.innerHTML = buttonHTML;
+                            
+                            // Re-apply button styles after innerHTML change
+                            button.style.setProperty('background-color', '#4CAF50', 'important');
+                            button.style.setProperty('color', '#FFFFFF', 'important');
+                            button.style.setProperty('border-color', '#4CAF50', 'important');
+                        }
+                        
+                        // Add hover effects (only once)
+                        button.addEventListener('mouseenter', function() {
+                            this.style.setProperty('background-color', '#45a049', 'important');
+                            this.style.setProperty('border-color', '#45a049', 'important');
+                        }, { once: false });
+                        button.addEventListener('mouseleave', function() {
+                            this.style.setProperty('background-color', '#4CAF50', 'important');
+                            this.style.setProperty('border-color', '#4CAF50', 'important');
+                        }, { once: false });
+                    } else if (button.classList.contains('profile-btn-styled')) {
+                        // Re-apply styles if already styled (in case Streamlit re-renders)
+                        button.style.setProperty('background-color', '#4CAF50', 'important');
+                        button.style.setProperty('color', '#FFFFFF', 'important');
+                        button.style.setProperty('border-color', '#4CAF50', 'important');
+                    }
+                });
+            }
+        }
+        // Run on page load and after Streamlit updates
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', styleCompleteProfileButton);
+        } else {
+            styleCompleteProfileButton();
+        }
+        // Also run after Streamlit reruns
+        window.addEventListener('load', styleCompleteProfileButton);
+        function fixChatInputBar() {
+            const chat = document.querySelector('[data-testid="stChatInput"]');
+            if (!chat) return;
+            
+            chat.style.setProperty('background-color', '#FFFFFF', 'important');
+            chat.style.setProperty('border-top', '1px solid #E0E0E0', 'important');
+            
+            const inner = chat.querySelectorAll('div, section');
+            inner.forEach(el => {
+                el.style.setProperty('background-color', '#FFFFFF', 'important');
+            });
+        }
+        
+        // Use MutationObserver to catch dynamic updates
+        const observer = new MutationObserver(function() {
+            styleCompleteProfileButton();
+            fixChatInputBar();
+        });
+        if (document.body) {
+            observer.observe(document.body, { childList: true, subtree: true });
+        }
+        
+        // Also call fixChatInputBar on load and after Streamlit updates
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', fixChatInputBar);
+        } else {
+            fixChatInputBar();
+        }
+        window.addEventListener('load', fixChatInputBar);
+        
+        // Function to harmonize grey boxes and elements
+        function harmonizeGreyBoxes() {
+            // Style all alert/notification boxes
+            const alerts = document.querySelectorAll('[data-testid="stAlert"], [data-baseweb="notification"]');
+            alerts.forEach(alert => {
+                const text = alert.textContent || '';
+                if (text.includes('✅') || text.includes('success') || alert.getAttribute('data-kind') === 'success') {
+                    alert.style.setProperty('background-color', '#E8F5E9', 'important');
+                    alert.style.setProperty('border-color', '#C8E6C9', 'important');
+                    alert.style.setProperty('color', '#000000', 'important');
+                } else if (text.includes('⚠️') || text.includes('warning') || alert.getAttribute('data-kind') === 'warning') {
+                    alert.style.setProperty('background-color', '#FFF3E0', 'important');
+                    alert.style.setProperty('border-color', '#FFE0B2', 'important');
+                    alert.style.setProperty('color', '#000000', 'important');
+                } else if (text.includes('❌') || text.includes('error') || alert.getAttribute('data-kind') === 'error') {
+                    alert.style.setProperty('background-color', '#FFEBEE', 'important');
+                    alert.style.setProperty('border-color', '#FFCDD2', 'important');
+                    alert.style.setProperty('color', '#000000', 'important');
+                } else if (text.includes('💡') || text.includes('info') || alert.getAttribute('data-kind') === 'info') {
+                    alert.style.setProperty('background-color', '#E3F2FD', 'important');
+                    alert.style.setProperty('border-color', '#BBDEFB', 'important');
+                    alert.style.setProperty('color', '#000000', 'important');
+                } else {
+                    // Default lighter grey
+                    alert.style.setProperty('background-color', '#F5F5F5', 'important');
+                    alert.style.setProperty('border-color', '#E0E0E0', 'important');
+                    alert.style.setProperty('color', '#000000', 'important');
+                }
+            });
+            
+            // Style file uploader - lighter background - entire container
+            const fileUploaders = document.querySelectorAll('[data-testid="stFileUploader"], [data-baseweb="file-uploader"]');
+            fileUploaders.forEach(uploader => {
+                uploader.style.setProperty('background-color', '#F5F5F5', 'important');
+                uploader.style.setProperty('border-color', '#E0E0E0', 'important');
+                uploader.style.setProperty('color', '#000000', 'important');
+                // Style all child elements - divs, spans, paragraphs, etc.
+                const allChildren = uploader.querySelectorAll('*');
+                allChildren.forEach(element => {
+                    // Skip buttons as they're handled separately
+                    if (element.tagName !== 'BUTTON' && !element.hasAttribute('role') || element.getAttribute('role') !== 'button') {
+                        element.style.setProperty('background-color', '#F5F5F5', 'important');
+                        element.style.setProperty('color', '#000000', 'important');
+                    }
+                });
+                // Style text elements specifically
+                const textElements = uploader.querySelectorAll('p, span, div, label');
+                textElements.forEach(element => {
+                    element.style.setProperty('color', '#000000', 'important');
+                });
+                // Style browse button specifically - target all button types
+                const buttons = uploader.querySelectorAll('button, [role="button"], [data-baseweb="button"]');
+                buttons.forEach(button => {
+                    button.style.setProperty('background-color', '#F5F5F5', 'important');
+                    button.style.setProperty('border-color', '#E0E0E0', 'important');
+                    button.style.setProperty('color', '#000000', 'important');
+                    // Style nested divs in BaseWeb buttons
+                    const buttonDivs = button.querySelectorAll('div');
+                    buttonDivs.forEach(div => {
+                        div.style.setProperty('background-color', '#F5F5F5', 'important');
+                        div.style.setProperty('color', '#000000', 'important');
+                    });
+                    // Style spans/text in buttons
+                    const buttonSpans = button.querySelectorAll('span');
+                    buttonSpans.forEach(span => {
+                        span.style.setProperty('color', '#000000', 'important');
+                    });
+                    // Add hover effect
+                    button.addEventListener('mouseenter', function() {
+                        this.style.setProperty('background-color', '#E0E0E0', 'important');
+                        this.style.setProperty('border-color', '#BDBDBD', 'important');
+                        const hoverDivs = this.querySelectorAll('div');
+                        hoverDivs.forEach(div => {
+                            div.style.setProperty('background-color', '#E0E0E0', 'important');
+                        });
+                    });
+                    button.addEventListener('mouseleave', function() {
+                        this.style.setProperty('background-color', '#F5F5F5', 'important');
+                        this.style.setProperty('border-color', '#E0E0E0', 'important');
+                        const leaveDivs = this.querySelectorAll('div');
+                        leaveDivs.forEach(div => {
+                            div.style.setProperty('background-color', '#F5F5F5', 'important');
+                        });
+                    });
+                });
+                // Style file input element
+                const fileInputs = uploader.querySelectorAll('input[type="file"]');
+                fileInputs.forEach(input => {
+                    input.style.setProperty('background-color', '#F5F5F5', 'important');
+                    input.style.setProperty('color', '#000000', 'important');
+                });
+            });
+            
+            // Style selectbox dropdowns - match text input styling
+            const selectboxes = document.querySelectorAll('.stSelectbox, [data-baseweb="select"]');
+            selectboxes.forEach(selectbox => {
+                selectbox.style.setProperty('background-color', '#F5F5F5', 'important');
+                const selectElement = selectbox.querySelector('select');
+                if (selectElement) {
+                    selectElement.style.setProperty('background-color', '#F5F5F5', 'important');
+                    selectElement.style.setProperty('color', '#000000', 'important');
+                    selectElement.style.setProperty('border-color', '#E0E0E0', 'important');
+                }
+                // Style the BaseWeb select component
+                const baseWebSelect = selectbox.querySelector('[data-baseweb="select"]');
+                if (baseWebSelect) {
+                    baseWebSelect.style.setProperty('background-color', '#F5F5F5', 'important');
+                    const innerSelect = baseWebSelect.querySelector('select');
+                    if (innerSelect) {
+                        innerSelect.style.setProperty('background-color', '#F5F5F5', 'important');
+                        innerSelect.style.setProperty('color', '#000000', 'important');
+                    }
+                }
+            });
+            
+            // Style expanders
+            const expanders = document.querySelectorAll('[data-testid="stExpander"]');
+            expanders.forEach(expander => {
+                const header = expander.querySelector('.streamlit-expanderHeader') || expander.querySelector('div:first-child');
+                const content = expander.querySelector('.streamlit-expanderContent') || expander.querySelector('div:last-child');
+                if (header) {
+                    header.style.setProperty('background-color', '#F5F5F5', 'important');
+                    header.style.setProperty('color', '#000000', 'important');
+                }
+                if (content) {
+                    content.style.setProperty('background-color', '#FAFAFA', 'important');
+                }
+            });
+            
+            // Style metrics
+            const metrics = document.querySelectorAll('[data-testid="stMetricContainer"]');
+            metrics.forEach(metric => {
+                metric.style.setProperty('background-color', '#F5F5F5', 'important');
+                const value = metric.querySelector('[data-testid="stMetricValue"]');
+                const label = metric.querySelector('[data-testid="stMetricLabel"]');
+                if (value) value.style.setProperty('color', '#000000', 'important');
+                if (label) label.style.setProperty('color', '#000000', 'important');
+            });
+            
+        }
+        
+        // Run harmonization on load and after updates
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', harmonizeGreyBoxes);
+        } else {
+            harmonizeGreyBoxes();
+        }
+        window.addEventListener('load', harmonizeGreyBoxes);
+        
+        // Use MutationObserver for dynamic content
+        const harmonizeObserver = new MutationObserver(harmonizeGreyBoxes);
+        if (document.body) {
+            harmonizeObserver.observe(document.body, { childList: true, subtree: true });
+        }
+        
+        // Add btn-danger class to Clear Profile button (no inline styles)
+        function addDangerClass() {
+            const allButtons = document.querySelectorAll('button');
+            allButtons.forEach(button => {
+                const buttonText = button.innerText || button.textContent || '';
+                // Check if button contains "Clear Profile" or trash emoji
+                if ((buttonText.includes('Clear Profile') || buttonText.includes('🗑️')) && !button.classList.contains('btn-danger')) {
+                    button.classList.add('btn-danger');
+                }
+            });
+        }
+        
+        // Run on load
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', addDangerClass);
+        } else {
+            addDangerClass();
+        }
+        window.addEventListener('load', addDangerClass);
+        
+        // Observe for dynamically added buttons
+        const dangerObserver = new MutationObserver(addDangerClass);
+        if (document.body) {
+            dangerObserver.observe(document.body, { childList: true, subtree: true });
+        }
+        
+        // Style transaction action buttons
+        function styleTxnActionButtons() {
+            const txnActions = document.querySelectorAll('.txn-actions');
+            txnActions.forEach(container => {
+                const buttons = container.querySelectorAll('button');
+                buttons.forEach(button => {
+                    const buttonText = button.innerText || button.textContent || '';
+                    // Remove existing classes first
+                    button.classList.remove('btn-primary', 'btn-danger');
+                    // Apply classes based on text
+                    if (buttonText.includes('Approve & Next')) {
+                        button.classList.add('btn-primary');
+                    } else if (buttonText.includes('Cancel')) {
+                        button.classList.add('btn-danger');
+                    }
+                });
+            });
+        }
+        
+        // Run on load
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', styleTxnActionButtons);
+        } else {
+            styleTxnActionButtons();
+        }
+        window.addEventListener('load', styleTxnActionButtons);
+        
+        // Observe for dynamically added transaction action buttons
+        const txnObserver = new MutationObserver(function(mutations) {
+            let shouldRun = false;
+            mutations.forEach(mutation => {
+                mutation.addedNodes.forEach(node => {
+                    if (node.nodeType === 1 && (node.classList.contains('txn-actions') || node.querySelector('.txn-actions'))) {
+                        shouldRun = true;
+                    }
+                });
+            });
+            if (shouldRun) {
+                styleTxnActionButtons();
+            }
+        });
+        if (document.body) {
+            txnObserver.observe(document.body, { childList: true, subtree: true });
+        }
+        
+        // Layer B: Targeted JS fixer - detect and fix dark backgrounds only
+        function fixDarkSurfaces() {
+            // Helper to calculate brightness from RGB
+            function getBrightness(rgb) {
+                if (!rgb || rgb === 'transparent' || rgb === 'rgba(0, 0, 0, 0)') {
+                    return 255; // transparent = bright
+                }
+                const match = rgb.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
+                if (!match) return 255;
+                const r = parseInt(match[1]);
+                const g = parseInt(match[2]);
+                const b = parseInt(match[3]);
+                const alpha = match[4] ? parseFloat(match[4]) : 1;
+                // Skip if transparent
+                if (alpha === 0) return 255;
+                // Calculate relative luminance (brightness)
+                const brightness = (r * 299 + g * 587 + b * 114) / 1000;
+                return brightness;
+            }
+            
+            // Target specific elements that might be dark
+            const selectors = [
+                'button',
+                '[data-testid="stMetricContainer"]',
+                '[data-baseweb="button"]',
+                '[data-baseweb="card"]',
+                '.stButton > button'
+            ];
+            
+            selectors.forEach(selector => {
+                const elements = document.querySelectorAll(selector);
+                elements.forEach(el => {
+                    // Skip if already processed or is an alert/notification
+                    if (el.classList.contains('no-dark-surface') || 
+                        el.closest('[data-testid="stAlert"]') ||
+                        el.closest('[data-baseweb="notification"]') ||
+                        el.closest('.stAlert')) {
+                        return;
+                    }
+                    
+                    // Skip semantic buttons
+                    if (el.classList.contains('btn-primary') || 
+                        el.classList.contains('btn-danger') ||
+                        el.getAttribute('kind') === 'primary') {
+                        return;
+                    }
+                    
+                    const computedStyle = window.getComputedStyle(el);
+                    const bgColor = computedStyle.backgroundColor;
+                    const brightness = getBrightness(bgColor);
+                    
+                    // If brightness is below threshold (dark), apply fix
+                    if (brightness < 60 && bgColor !== 'transparent' && bgColor !== 'rgba(0, 0, 0, 0)') {
+                        el.classList.add('no-dark-surface');
+                    }
+                });
+            });
+        }
+        
+        // Run on load
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', fixDarkSurfaces);
+        } else {
+            fixDarkSurfaces();
+        }
+        window.addEventListener('load', fixDarkSurfaces);
+        
+        // Observe for dynamically added elements (scoped to avoid performance issues)
+        const darkFixObserver = new MutationObserver(function(mutations) {
+            let shouldRun = false;
+            mutations.forEach(mutation => {
+                mutation.addedNodes.forEach(node => {
+                    if (node.nodeType === 1 && (
+                        node.tagName === 'BUTTON' ||
+                        node.hasAttribute('data-testid') ||
+                        node.hasAttribute('data-baseweb')
+                    )) {
+                        shouldRun = true;
+                    }
+                });
+            });
+            if (shouldRun) {
+                setTimeout(fixDarkSurfaces, 100);
+            }
+        });
+        if (document.body) {
+            darkFixObserver.observe(document.body, { childList: true, subtree: true });
+        }
+        </script>
+    """, unsafe_allow_html=True)
 
 
 def main():
+    # Apply custom color scheme
+    apply_custom_theme()
     # Sidebar Navigation
-    st.sidebar.title("💰 Accountable AI v1")
+    display_logo()
     st.sidebar.markdown("---")
     
     page = st.sidebar.radio(
@@ -1792,8 +2926,10 @@ def main():
     if not st.session_state.user_profile.get("profile_completed") and page != "Settings":
         with st.sidebar:
             st.markdown("---")
-            if st.button("👤 Complete Profile", use_container_width=True):
+            st.markdown('<div class="complete-profile-button-container">', unsafe_allow_html=True)
+            if st.button("👤 Complete Profile", use_container_width=True, key="complete_profile_btn"):
                 st.session_state.show_questionnaire = True
+            st.markdown('</div>', unsafe_allow_html=True)
     
     # Show questionnaire if requested
     if st.session_state.get("show_questionnaire", False):

@@ -27,15 +27,17 @@ def geocode_location(location: Dict[str, Optional[str]], timeout: int = 10) -> O
     Geocode a location to lat/lon using Nominatim (OpenStreetMap).
     
     Args:
-        location: Dict with keys: country, city, state (all optional)
+        location: Dict with keys: country, city, state, zip (all optional)
         timeout: Request timeout in seconds
     
     Returns:
         (lat, lon) tuple or None if geocoding fails
     """
     try:
-        # Build query string
+        # Build query string - prioritize zip code if available for more accurate results
         query_parts = []
+        if location.get("zip"):
+            query_parts.append(location["zip"])
         if location.get("city"):
             query_parts.append(location["city"])
         if location.get("state"):
