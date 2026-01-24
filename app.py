@@ -4,6 +4,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import plotly.io as pio
 from datetime import datetime
+import logging
 
 # Set global Plotly default template to light theme
 pio.templates.default = "plotly_white"
@@ -14,9 +15,17 @@ import json
 import tempfile
 import os
 from typing import List, Dict, Optional
-from store_locator import get_nearby_grocery_stores, filter_stores_by_name
 
-# No external PDF libraries needed - using OpenAI API directly
+logger = logging.getLogger(__name__)
+from store_locator import get_nearby_grocery_stores, filter_stores_by_name
+from pdf_parser import (
+    parse_pdf_deterministic,
+    validate,
+    llm_repair,
+    Transaction
+)
+
+# PDF parsing: deterministic first, LLM as fallback
 
 # ============================================================================
 # API Keys Configuration
@@ -150,25 +159,176 @@ def get_openai_client() -> Optional[OpenAI]:
     return OpenAI(api_key=key)
 
 
-def extract_transactions_from_pdf_with_openai(client: OpenAI, pdf_file) -> List[Dict]:
+def extract_transactions_from_pdf_with_openai(client: OpenAI, pdf_file, 
+                                             use_ai: bool = False, 
+                                             min_txns: int = 5) -> Dict:
     """
-    Use OpenAI API to extract transactions directly from PDF file.
-    Uploads PDF to OpenAI and uses Assistants API to extract transactions.
-    Returns list of transaction dictionaries.
+    Extract transactions from PDF using deterministic parsing first, LLM as optional enrichment.
+    
+    Strategy:
+    1. Always run deterministic parsing first
+    2. If deterministic returns >= min_txns, store immediately as source of truth
+    3. Only run OpenAI extraction if:
+       - deterministic returned < min_txns, OR
+       - use_ai is True (user explicitly requested), OR
+       - deterministic flagged low-confidence sections
+    4. If OpenAI fails/times out, keep deterministic results
+    5. Merge results: prefer deterministic, use AI for enrichment only
+    
+    Args:
+        client: OpenAI client
+        pdf_file: PDF file object
+        use_ai: Whether to run AI extraction even if deterministic succeeds
+        min_txns: Minimum transactions threshold for deterministic success
+        
+    Returns:
+        Dictionary with:
+        - deterministic_txns: List of deterministic transaction dicts
+        - ai_txns: List of AI transaction dicts (or None if not run/failed)
+        - final_txns: Merged final transaction list
+        - ai_status: "idle", "running", "completed", "failed", "timeout"
+        - diagnostics: Dict with parsing stats
     """
+    # Initialize return structure
+    result = {
+        "deterministic_txns": [],
+        "ai_txns": None,
+        "final_txns": [],
+        "ai_status": "idle",
+        "diagnostics": {
+            "deterministic_count": 0,
+            "deterministic_confidence": 0.0,
+            "ai_count": 0,
+            "ai_duration": 0.0,
+            "merged_count": 0,
+            "added_by_ai": 0,
+            "enriched_by_ai": 0
+        }
+    }
+    
     try:
         # Reset file pointer and read PDF bytes
         pdf_file.seek(0)
         pdf_bytes = pdf_file.read()
         
-        # Save to temporary file for upload
+        # Save to temporary file
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
             tmp_file.write(pdf_bytes)
             tmp_path = tmp_file.name
         
         try:
+            # STEP 1: Always run deterministic parsing first
+            deterministic_txns = []
+            debug_info = {}
+            is_valid = False
+            
+            try:
+                with st.spinner("📄 Extracting transactions from PDF (deterministic parsing)..."):
+                    transactions, debug_info = parse_pdf_deterministic(tmp_path)
+                
+                # Convert Transaction objects to dict format
+                for txn in transactions:
+                    amount_abs = abs(txn.amount)
+                    merchant_guess = txn.description[:50]
+                    # Use contextual inference for direction (not just amount sign)
+                    direction = infer_transaction_direction(
+                        description=txn.description,
+                        merchant=merchant_guess,
+                        amount=txn.amount
+                    )
+                    
+                    deterministic_txns.append({
+                        "posted_date": txn.post_date,
+                        "description_raw": txn.description,
+                        "merchant_guess": merchant_guess,
+                        "amount": round(amount_abs, 2),
+                        "direction": direction,
+                        "category": "Uncategorized",
+                        "source": "deterministic",
+                        "confidence": 0.85
+                    })
+                
+                # Validate results
+                is_valid, error_msg = validate(transactions, debug_info)
+                result["diagnostics"]["deterministic_count"] = len(deterministic_txns)
+                result["diagnostics"]["deterministic_confidence"] = 0.85 if is_valid else 0.5
+                
+                if is_valid:
+                    st.success(f"✅ Deterministic parsing found {len(deterministic_txns)} transactions")
+                else:
+                    st.warning(f"⚠️ Deterministic parsing found {len(deterministic_txns)} transactions (expected >= {min_txns})")
+                    with st.expander("View parsing diagnostics"):
+                        st.text(error_msg)
+                
+            except Exception as e:
+                # Deterministic parsing failed entirely
+                st.warning(f"⚠️ Deterministic parsing failed: {str(e)}")
+                logger.error(f"Deterministic parsing error: {e}")
+            
+            # Store deterministic results immediately (source of truth)
+            result["deterministic_txns"] = deterministic_txns
+            result["final_txns"] = deterministic_txns.copy()  # Start with deterministic
+            
+            # STEP 2: Decide if we need OpenAI extraction
+            should_run_ai = (
+                len(deterministic_txns) < min_txns or  # Too few transactions
+                use_ai or  # User explicitly requested
+                not is_valid  # Low confidence
+            )
+            
+            if should_run_ai:
+                result["ai_status"] = "running"
+                ai_txns = _extract_with_openai_assistant(client, tmp_path, result)
+                result["ai_txns"] = ai_txns
+                
+                # Merge results if AI succeeded
+                if ai_txns is not None and len(ai_txns) > 0:
+                    result["final_txns"] = _merge_transactions(
+                        deterministic_txns, 
+                        ai_txns, 
+                        result["diagnostics"]
+                    )
+            else:
+                st.info("💡 Deterministic parsing succeeded. Skipping AI extraction.")
+            
+        finally:
+            # Clean up temporary file
+            if os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except:
+                    pass
+        
+        return result
+        
+    except Exception as e:
+        error_msg = str(e)
+        st.error(f"❌ Error extracting transactions: {error_msg}")
+        logger.error(f"Extraction error: {e}")
+        # Return whatever deterministic results we have
+        result["final_txns"] = result["deterministic_txns"]
+        return result
+
+
+def _extract_with_openai_assistant(client: OpenAI, pdf_path: str, result_dict: Dict) -> Optional[List[Dict]]:
+    """
+    Extract transactions using OpenAI Assistants API with proper polling.
+    
+    Args:
+        client: OpenAI client
+        pdf_path: Path to PDF file
+        result_dict: Result dictionary to update with status and diagnostics
+        
+    Returns:
+        List of transaction dicts, or None if extraction failed
+    """
+    import time
+    start_time = time.time()
+    
+    try:
+        with st.spinner("🤖 Using AI to extract transactions (this may take 30-60 seconds)..."):
             # Upload PDF file to OpenAI
-            with open(tmp_path, 'rb') as f:
+            with open(pdf_path, 'rb') as f:
                 uploaded_file = client.files.create(
                     file=f,
                     purpose='assistants'
@@ -231,24 +391,41 @@ Return ONLY the JSON object, nothing else."""
                 assistant_id=assistant.id
             )
             
-            # Wait for completion
-            import time
+            # Poll with exponential backoff
             max_wait = 60  # 60 seconds max
             waited = 0
-            while run.status in ['queued', 'in_progress'] and waited < max_wait:
-                time.sleep(2)
-                waited += 2
-                run = client.beta.threads.runs.retrieve(
-                    thread_id=thread.id,
-                    run_id=run.id
-                )
+            backoff_delay = 0.5  # Start with 0.5s
+            max_backoff = 4.0  # Cap at 4s
+            
+            while waited < max_wait:
+                if run.status == 'completed':
+                    result_dict["ai_status"] = "completed"
+                    break
+                elif run.status in ['failed', 'cancelled', 'expired']:
+                    result_dict["ai_status"] = "failed"
+                    raise Exception(f"AI extraction {run.status}: {run.last_error or 'Unknown error'}")
+                elif run.status in ['queued', 'in_progress']:
+                    # in_progress is NOT an error - keep waiting
+                    time.sleep(backoff_delay)
+                    waited += backoff_delay
+                    backoff_delay = min(backoff_delay * 2, max_backoff)  # Exponential backoff
+                    
+                    # Update run status
+                    run = client.beta.threads.runs.retrieve(
+                        thread_id=thread.id,
+                        run_id=run.id
+                    )
+                else:
+                    result_dict["ai_status"] = "failed"
+                    raise Exception(f"Unexpected run status: {run.status}")
             
             if run.status != 'completed':
-                raise Exception(f"Run failed with status: {run.status}")
+                result_dict["ai_status"] = "timeout"
+                raise Exception(f"AI extraction timed out after {max_wait}s (status: {run.status})")
             
             # Get response
             messages = client.beta.threads.messages.list(thread_id=thread.id)
-            result = messages.data[0].content[0].text.value
+            result_text = messages.data[0].content[0].text.value
             
             # Clean up
             try:
@@ -258,7 +435,7 @@ Return ONLY the JSON object, nothing else."""
                 pass
             
             # Parse JSON from result
-            result_clean = result.strip()
+            result_clean = result_text.strip()
             
             # Remove markdown code blocks if present
             if "```json" in result_clean:
@@ -309,13 +486,11 @@ Return ONLY the JSON object, nothing else."""
                             pass
             
             if parsed is None:
-                # Show what we got for debugging
-                st.warning(f"⚠️ Could not parse JSON from assistant response.")
-                with st.expander("View Assistant Response (for debugging)"):
-                    st.text(result[:2000] if len(result) > 2000 else result)
-                if json_errors:
-                    st.debug(f"JSON parsing errors: {json_errors[-1]}")
-                raise Exception("Could not parse JSON from assistant response")
+                result_dict["ai_status"] = "failed"
+                st.warning(f"⚠️ Could not parse JSON from AI response.")
+                with st.expander("View AI Response (for debugging)"):
+                    st.text(result_text[:2000] if len(result_text) > 2000 else result_text)
+                return None
             
             # Extract transactions array
             if isinstance(parsed, dict):
@@ -340,37 +515,124 @@ Return ONLY the JSON object, nothing else."""
                     amount = abs(float(txn.get("amount", 0)))
                     if amount == 0:
                         continue
-                    direction = txn.get("direction", "expense").lower()
-                    if direction not in ["expense", "income"]:
-                        direction = "expense"
+                    
+                    description_raw = txn.get("description_raw", "Unknown")
+                    merchant_guess = txn.get("merchant_guess", description_raw[:50])
+                    
+                    # Use contextual inference for direction (override AI if needed)
+                    # AI direction can be used as a hint, but we validate with contextual inference
+                    ai_direction = txn.get("direction", "expense").lower()
+                    if ai_direction not in ["expense", "income"]:
+                        ai_direction = "expense"
+                    
+                    # Apply contextual inference
+                    direction = infer_transaction_direction(
+                        description=description_raw,
+                        merchant=merchant_guess,
+                        amount=float(txn.get("amount", 0))
+                    )
                     
                     transactions.append({
                         "posted_date": posted_date,
-                        "description_raw": txn.get("description_raw", "Unknown"),
-                        "merchant_guess": txn.get("merchant_guess", txn.get("description_raw", "Unknown")[:50]),
+                        "description_raw": description_raw,
+                        "merchant_guess": merchant_guess,
                         "amount": round(amount, 2),
                         "direction": direction,
                         "category": "Uncategorized",
-                        "source": "statement_pdf",
-                        "confidence": 0.9
+                        "source": "ai",
+                        "confidence": 0.75
                     })
-                except:
+                except Exception as e:
+                    logger.warning(f"Error parsing AI transaction: {e}")
                     continue
+            
+            # Update diagnostics
+            duration = time.time() - start_time
+            result_dict["diagnostics"]["ai_count"] = len(transactions)
+            result_dict["diagnostics"]["ai_duration"] = duration
+            
+            if transactions:
+                st.success(f"✅ AI extraction found {len(transactions)} transactions")
+            else:
+                st.warning("⚠️ AI extraction returned 0 transactions")
+                result_dict["ai_status"] = "failed"
             
             return transactions
             
-        finally:
-            # Clean up temporary file
-            if os.path.exists(tmp_path):
-                try:
-                    os.unlink(tmp_path)
-                except:
-                    pass
-        
     except Exception as e:
         error_msg = str(e)
-        st.error(f"❌ Error extracting transactions with OpenAI: {error_msg}")
-        return []
+        result_dict["ai_status"] = "failed"
+        st.warning(f"⚠️ AI extraction failed: {error_msg}")
+        logger.error(f"AI extraction error: {e}")
+        return None
+
+
+def _merge_transactions(deterministic_txns: List[Dict], ai_txns: List[Dict], diagnostics: Dict) -> List[Dict]:
+    """
+    Merge deterministic and AI transactions, preferring deterministic as source of truth.
+    
+    Strategy:
+    - Use all deterministic transactions
+    - Add AI transactions only if they don't duplicate deterministic ones
+    - Use AI data to enrich deterministic transactions (e.g., better merchant names)
+    
+    Args:
+        deterministic_txns: List of deterministic transaction dicts
+        ai_txns: List of AI transaction dicts
+        diagnostics: Diagnostics dict to update with merge stats
+        
+    Returns:
+        Merged list of transaction dicts
+    """
+    # Start with deterministic transactions (source of truth)
+    merged = deterministic_txns.copy()
+    
+    # Create a deduplication key for deterministic transactions
+    # Key: (date, amount, normalized_description)
+    def make_key(txn):
+        desc = txn.get("description_raw", "").lower().strip()[:50]
+        return (
+            txn.get("posted_date", ""),
+            round(float(txn.get("amount", 0)), 2),
+            desc
+        )
+    
+    deterministic_keys = {make_key(txn) for txn in deterministic_txns}
+    
+    # Track enrichment
+    enriched_count = 0
+    added_count = 0
+    
+    # Process AI transactions
+    for ai_txn in ai_txns:
+        ai_key = make_key(ai_txn)
+        
+        if ai_key in deterministic_keys:
+            # This AI transaction matches a deterministic one - use AI to enrich
+            # Find matching deterministic transaction
+            for i, det_txn in enumerate(merged):
+                if make_key(det_txn) == ai_key:
+                    # Enrich with AI data (better merchant name, category, etc.)
+                    if ai_txn.get("merchant_guess") and len(ai_txn.get("merchant_guess", "")) > 0:
+                        if not det_txn.get("merchant_guess") or len(det_txn.get("merchant_guess", "")) < len(ai_txn.get("merchant_guess", "")):
+                            merged[i]["merchant_guess"] = ai_txn["merchant_guess"]
+                            enriched_count += 1
+                    if ai_txn.get("category") and ai_txn.get("category") != "Uncategorized":
+                        if det_txn.get("category") == "Uncategorized":
+                            merged[i]["category"] = ai_txn["category"]
+                            enriched_count += 1
+                    break
+        else:
+            # New transaction from AI - add it
+            merged.append(ai_txn)
+            added_count += 1
+    
+    # Update diagnostics
+    diagnostics["merged_count"] = len(merged)
+    diagnostics["added_by_ai"] = added_count
+    diagnostics["enriched_by_ai"] = enriched_count
+    
+    return merged
 
 
 def extract_transactions_from_text(parsed_text: str) -> List[Dict]:
@@ -421,12 +683,9 @@ def extract_transactions_from_text(parsed_text: str) -> List[Dict]:
                 amount_str, amount = valid_amounts[-1]
                 
                 # Handle negative amounts in parentheses
+                original_amount_sign = amount
                 if '(' in amount_str:
                     amount = -abs(amount)
-                
-                # Determine direction
-                direction = "expense" if amount < 0 else "income"
-                amount = abs(amount)
                 
                 # Extract description (everything except date and amount patterns)
                 description = line
@@ -465,6 +724,16 @@ def extract_transactions_from_text(parsed_text: str) -> List[Dict]:
                 if len(merchant_guess) > 50:
                     merchant_guess = merchant_guess[:47] + "..."
                 
+                # Use contextual inference for direction (not just amount sign)
+                direction = infer_transaction_direction(
+                    description=description,
+                    merchant=merchant_guess,
+                    amount=original_amount_sign
+                )
+                
+                # Store amount as positive (direction already determined)
+                amount_abs = abs(amount)
+                
                 # Confidence scoring
                 # Higher confidence if we have clear tabular structure (multiple aligned elements)
                 confidence = 0.9 if '|' in line or '\t' in line else 0.6
@@ -473,7 +742,7 @@ def extract_transactions_from_text(parsed_text: str) -> List[Dict]:
                     "posted_date": posted_date,
                     "description_raw": description,
                     "merchant_guess": merchant_guess,
-                    "amount": round(amount, 2),
+                    "amount": round(amount_abs, 2),
                     "direction": direction,
                     "category": "Uncategorized",
                     "source": "statement_pdf",
@@ -492,6 +761,421 @@ def extract_transactions_from_text(parsed_text: str) -> List[Dict]:
             unique_transactions.append(txn)
     
     return unique_transactions
+
+
+def infer_transaction_direction(description: str, merchant: str = "", amount: float = 0.0) -> str:
+    """
+    Infer transaction direction (income vs expense) using contextual signals.
+    
+    Does NOT rely solely on numeric sign. Uses:
+    - Transaction description wording (keywords)
+    - Merchant identity and typical behavior
+    - Whether transaction represents money leaving or entering account
+    
+    Rules:
+    - Debit card purchases, card payments, POS transactions, transportation charges
+      are expenses even if amount is positive
+    - Only classify as Income when there is explicit evidence (payroll, deposit, refund, interest)
+    - Default to expense for ambiguous cases
+    
+    Args:
+        description: Transaction description text
+        merchant: Merchant name (optional, can be same as description)
+        amount: Transaction amount (optional, for validation)
+        
+    Returns:
+        "income" or "expense"
+    """
+    # Combine description and merchant for analysis
+    text = f"{description} {merchant}".lower()
+    
+    # Explicit income indicators (strong signals)
+    income_keywords = [
+        'payroll', 'salary', 'wage', 'direct deposit', 'deposit',
+        'refund', 'reimbursement', 'interest', 'dividend',
+        'transfer in', 'credit', 'payment received', 'cash back',
+        'reward', 'bonus', 'income', 'revenue', 'earnings',
+        'government payment', 'social security', 'pension',
+        'tax refund', 'rebate', 'settlement'
+    ]
+    
+    # Explicit expense indicators (strong signals)
+    expense_keywords = [
+        'debit card', 'card purchase', 'card payment', 'pos transaction',
+        'point of sale', 'purchase', 'payment', 'charge', 'fee',
+        'withdrawal', 'atm', 'transfer out', 'bill pay', 'subscription',
+        'rent', 'mortgage', 'loan payment', 'insurance', 'utility',
+        'transportation', 'uber', 'lyft', 'taxi', 'metro', 'transit',
+        'gas station', 'fuel', 'parking', 'toll', 'bus', 'train',
+        'restaurant', 'dining', 'food', 'grocery', 'store',
+        'shopping', 'retail', 'merchant', 'vendor'
+    ]
+    
+    # Check for explicit income indicators first
+    income_score = sum(1 for kw in income_keywords if kw in text)
+    
+    # Check for explicit expense indicators
+    expense_score = sum(1 for kw in expense_keywords if kw in text)
+    
+    # Special patterns that strongly indicate expense even if positive
+    expense_patterns = [
+        r'\b(debit|card|purchase|payment|pos|point of sale)\b',
+        r'\b(transport|uber|lyft|taxi|metro|transit|bus|train)\b',
+        r'\b(gas|fuel|parking|toll)\b',
+        r'\b(restaurant|dining|food|grocery|store|shopping|retail)\b'
+    ]
+    
+    expense_pattern_matches = sum(1 for pattern in expense_patterns if re.search(pattern, text, re.IGNORECASE))
+    
+    # Decision logic:
+    # 1. If explicit income keywords found and no conflicting expense signals, classify as income
+    if income_score > 0 and expense_score == 0 and expense_pattern_matches == 0:
+        return "income"
+    
+    # 2. If expense keywords or patterns found, classify as expense (even if amount is positive)
+    if expense_score > 0 or expense_pattern_matches > 0:
+        return "expense"
+    
+    # 3. If income keywords found but also expense signals, prefer expense (more conservative)
+    if income_score > 0 and (expense_score > 0 or expense_pattern_matches > 0):
+        return "expense"
+    
+    # 4. Default: expense (most transactions are expenses)
+    return "expense"
+
+
+def _normalize_description(description: str) -> str:
+    """Normalize description for fingerprinting (remove extra whitespace, lowercase)."""
+    if not description:
+        return ""
+    # Remove extra whitespace, convert to lowercase
+    normalized = re.sub(r'\s+', ' ', str(description).strip().lower())
+    return normalized[:100]  # Limit length for fingerprinting
+
+
+def _compute_transaction_fingerprint(txn: Dict, include_direction: bool = True) -> str:
+    """
+    Compute a fingerprint for a transaction for deduplication.
+    
+    Args:
+        txn: Transaction dictionary
+        include_direction: Whether to include direction in fingerprint
+        
+    Returns:
+        Fingerprint string
+    """
+    date = str(txn.get("posted_date", "")).strip()
+    desc = _normalize_description(txn.get("description_raw", ""))
+    amount_abs = round(abs(float(txn.get("amount", 0))), 2)
+    
+    if include_direction:
+        direction = str(txn.get("direction", "")).lower()
+        return f"{date}|{desc}|{amount_abs}|{direction}"
+    else:
+        return f"{date}|{desc}|{amount_abs}"
+
+
+def _assign_category_from_direction(txn: Dict) -> str:
+    """
+    Assign category based on direction and transaction keywords.
+    
+    Rules:
+    - If direction=income and invoice/client signals exist -> use INCOME_CATEGORY (will be shown as income)
+    - Only classify as Housing if explicit housing keywords exist (rent/lease/mortgage/landlord)
+    - Category assignment MUST depend on direction
+    """
+    direction = str(txn.get("direction", "")).lower()
+    description = str(txn.get("description_raw", "")).lower()
+    text = f"{description} {txn.get('merchant_guess', '')}".lower()
+    
+    # Income categories - MUST check direction first
+    if direction == "income":
+        # Check for client/invoice signals - these are income transactions
+        if any(kw in text for kw in ['client', 'invoice', 'inv#', 'inv ', 'payment received']):
+            # Client/invoice payments are income - use INCOME_CATEGORY
+            return INCOME_CATEGORY
+        # Generic income
+        return INCOME_CATEGORY
+    
+    # Expense categories - MUST check direction first, only assign Housing if explicit keywords
+    if direction == "expense":
+        # Housing keywords (must be explicit - rent/lease/mortgage/landlord)
+        housing_keywords = ['rent', 'lease', 'mortgage', 'landlord', 'apartment', 'housing']
+        if any(kw in text for kw in housing_keywords):
+            return "Housing"
+        # Keep as Uncategorized for now - will be categorized by AI or user
+        return "Uncategorized"
+    
+    # Unknown direction - keep uncategorized (don't assume)
+    return "Uncategorized"
+
+
+def _infer_direction_with_confidence(txn: Dict) -> tuple:
+    """
+    Infer transaction direction with confidence scoring.
+    
+    Returns:
+        (direction, confidence) tuple
+        - direction: "income", "expense", or "unknown"
+        - confidence: float between 0.0 and 1.0
+    """
+    description = str(txn.get("description_raw", "")).lower()
+    merchant = str(txn.get("merchant_guess", "")).lower()
+    amount_abs = float(txn.get("amount", 0))  # Already normalized to positive
+    existing_direction = str(txn.get("direction", "")).lower()
+    
+    # Try to get original signed amount from raw_row if available
+    original_amount_signed = None
+    raw_row = txn.get("raw_row", {})
+    if isinstance(raw_row, dict):
+        # Look for amount column in raw_row
+        for col_name, col_val in raw_row.items():
+            col_lower = str(col_name).lower()
+            if any(x in col_lower for x in ['amount', 'value', 'debit', 'credit']):
+                try:
+                    val_str = str(col_val).strip()
+                    # Handle parentheses (negative)
+                    is_negative = val_str.startswith('(') and val_str.endswith(')')
+                    if is_negative:
+                        val_str = val_str[1:-1]
+                    val_clean = re.sub(r'[\$€£¥,\s]', '', val_str)
+                    if val_clean:
+                        original_amount_signed = float(val_clean)
+                        if is_negative:
+                            original_amount_signed = -original_amount_signed
+                        break
+                except:
+                    pass
+    
+    text = f"{description} {merchant}"
+    
+    # ============================================================================
+    # STRONG SIGNALS (confidence >= 0.9)
+    # ============================================================================
+    
+    # Separate debit/credit columns (if present in raw data)
+    raw_row = txn.get("raw_row", {})
+    if isinstance(raw_row, dict):
+        for col_name, col_val in raw_row.items():
+            col_lower = str(col_name).lower()
+            val_str = str(col_val).strip()
+            
+            # Check for debit column with value
+            if any(x in col_lower for x in ['debit', 'withdrawal', 'payment', 'out']):
+                if val_str and val_str not in ['', '0', '0.00', 'nan', 'none']:
+                    try:
+                        val_amt = abs(float(re.sub(r'[\$€£¥,\s]', '', val_str)))
+                        if val_amt > 0:
+                            return ("expense", 0.95)
+                    except:
+                        pass
+            
+            # Check for credit column with value
+            if any(x in col_lower for x in ['credit', 'deposit', 'income', 'in', 'received']):
+                if val_str and val_str not in ['', '0', '0.00', 'nan', 'none']:
+                    try:
+                        val_amt = abs(float(re.sub(r'[\$€£¥,\s]', '', val_str)))
+                        if val_amt > 0:
+                            return ("income", 0.95)
+                    except:
+                        pass
+    
+    # Explicit debit/credit markers in text
+    if re.search(r'\b(dr|debit)\b', text, re.IGNORECASE):
+        return ("expense", 0.9)
+    if re.search(r'\b(cr|credit)\b', text, re.IGNORECASE):
+        return ("income", 0.9)
+    
+    # ============================================================================
+    # MEDIUM SIGNALS (confidence 0.7-0.85)
+    # ============================================================================
+    
+    # Income keywords (CLIENT/INV/INVOICE => income unless PURCHASE/CARD/POS/DEBIT present)
+    income_keywords = [
+        'client', 'invoice', 'inv#', 'inv ', 'payment received', 'deposit',
+        'payroll', 'salary', 'refund', 'reimbursement', 'interest'
+    ]
+    income_score = sum(1 for kw in income_keywords if kw in text)
+    
+    # Expense keywords (strong expense signals)
+    expense_keywords_strong = [
+        'purchase', 'card', 'pos', 'debit', 'point of sale'
+    ]
+    expense_keywords_weak = [
+        'payment', 'charge', 'fee', 'withdrawal', 'atm', 'subscription', 'rent', 'mortgage'
+    ]
+    expense_score_strong = sum(1 for kw in expense_keywords_strong if kw in text)
+    expense_score_weak = sum(1 for kw in expense_keywords_weak if kw in text)
+    
+    # If CLIENT/INV/INVOICE present but no strong expense signals, classify as income
+    if income_score > 0 and expense_score_strong == 0:
+        return ("income", 0.8)
+    
+    # If strong expense signals present, classify as expense
+    if expense_score_strong > 0:
+        return ("expense", 0.8)
+    
+    # If only weak expense signals and no income signals
+    if expense_score_weak > 0 and income_score == 0:
+        return ("expense", 0.75)
+    
+    # If income signals present but also weak expense signals
+    if income_score > 0 and expense_score_weak > 0:
+        # Prefer income if income score is higher
+        if income_score > expense_score_weak:
+            return ("income", 0.75)
+        else:
+            return ("expense", 0.75)
+    
+    # If only income signals
+    if income_score > 0:
+        return ("income", 0.75)
+    
+    # ============================================================================
+    # WEAK SIGNAL (confidence 0.5-0.6) - Amount sign only
+    # ============================================================================
+    
+    # Only use amount sign if no other signals found
+    if income_score == 0 and expense_score_strong == 0 and expense_score_weak == 0:
+        if original_amount_signed is not None:
+            if original_amount_signed < 0:
+                return ("expense", 0.6)
+            elif original_amount_signed > 0:
+                return ("income", 0.6)
+    
+    # ============================================================================
+    # DEFAULT
+    # ============================================================================
+    
+    # If we have an existing direction but low confidence, keep it
+    if existing_direction in ["income", "expense"]:
+        return (existing_direction, 0.5)
+    
+    return ("unknown", 0.0)
+
+
+def post_process_transactions(transactions: List[Dict]) -> List[Dict]:
+    """
+    Post-process parsed transactions (from PDF or CSV) with:
+    1. Normalization to canonical schema
+    2. Deterministic direction inference with confidence
+    3. Deduplication using fingerprints
+    4. Conflict handling (keep both, flag for review)
+    
+    Args:
+        transactions: List of raw transaction dictionaries
+        
+    Returns:
+        List of normalized, deduplicated transactions
+    """
+    if not transactions:
+        return []
+    
+    # ============================================================================
+    # STEP 1: Normalize to canonical schema
+    # ============================================================================
+    
+    normalized = []
+    for txn in transactions:
+        # Ensure required fields exist
+        normalized_txn = {
+            "posted_date": str(txn.get("posted_date", "")).strip(),
+            "description_raw": str(txn.get("description_raw", "Unknown Transaction")).strip(),
+            "merchant_guess": str(txn.get("merchant_guess", txn.get("description_raw", "Unknown")[:50])).strip(),
+            "amount": round(abs(float(txn.get("amount", 0))), 2),
+            "direction": str(txn.get("direction", "expense")).lower(),
+            "category": str(txn.get("category", "Uncategorized")).strip(),
+            "source": str(txn.get("source", "unknown")).strip(),
+            "confidence": float(txn.get("confidence", 0.5)),
+        }
+        
+        # Preserve raw_row if present (for debugging)
+        if "raw_row" in txn:
+            normalized_txn["raw_row"] = txn["raw_row"]
+        
+        # Skip invalid transactions
+        if not normalized_txn["posted_date"] or normalized_txn["amount"] == 0:
+            continue
+        
+        normalized.append(normalized_txn)
+    
+    # ============================================================================
+    # STEP 2: Deterministic direction inference with confidence
+    # ============================================================================
+    
+    for txn in normalized:
+        inferred_direction, confidence = _infer_direction_with_confidence(txn)
+        
+        # Only override existing direction if confidence >= 0.85
+        if confidence >= 0.85:
+            if inferred_direction != "unknown":
+                old_direction = txn["direction"]
+                txn["direction"] = inferred_direction
+                txn["direction_confidence"] = confidence
+                if old_direction != inferred_direction:
+                    logger.debug(f"Direction override: {old_direction} -> {inferred_direction} (confidence: {confidence:.2f})")
+        else:
+            # Keep original direction or set to inferred (including "unknown" if ambiguous)
+            if txn["direction"] not in ["income", "expense", "unknown"]:
+                txn["direction"] = inferred_direction  # Can be "unknown"
+            txn["direction_confidence"] = confidence
+        
+        # Auto-assign category based on direction and keywords
+        if txn["category"] == "Uncategorized":
+            txn["category"] = _assign_category_from_direction(txn)
+    
+    # ============================================================================
+    # STEP 3: Deduplication using fingerprints
+    # ============================================================================
+    
+    seen_fingerprints = {}  # fingerprint -> list of transactions with that fingerprint
+    deduplicated = []
+    
+    for txn in normalized:
+        # Create fingerprint without direction (to detect conflicts)
+        fingerprint = _compute_transaction_fingerprint(txn, include_direction=False)
+        
+        if fingerprint not in seen_fingerprints:
+            seen_fingerprints[fingerprint] = []
+        
+        seen_fingerprints[fingerprint].append(txn)
+    
+    # Process each fingerprint group
+    for fingerprint, txn_group in seen_fingerprints.items():
+        if len(txn_group) == 1:
+            # No duplicates, add as-is
+            deduplicated.append(txn_group[0])
+        else:
+            # Check for direction conflicts
+            directions = set(txn["direction"] for txn in txn_group)
+            
+            if len(directions) > 1:
+                # Conflict: same transaction with different directions
+                # Keep all and flag for review
+                logger.warning(f"Direction conflict detected for fingerprint {fingerprint}: {directions}")
+                for txn in txn_group:
+                    txn["needs_review"] = True
+                    txn["review_reason"] = f"Direction conflict: {', '.join(directions)}"
+                    deduplicated.append(txn)
+            else:
+                # Same direction - keep only one (prefer highest confidence)
+                best_txn = max(txn_group, key=lambda t: (
+                    t.get("direction_confidence", 0),
+                    t.get("confidence", 0)
+                ))
+                deduplicated.append(best_txn)
+                if len(txn_group) > 1:
+                    logger.debug(f"Deduplicated {len(txn_group)} identical transactions")
+    
+    # LOGGING CHECKPOINT: Final results
+    income_count = sum(1 for t in deduplicated if t.get("direction") == "income")
+    expense_count = sum(1 for t in deduplicated if t.get("direction") == "expense")
+    unknown_count = sum(1 for t in deduplicated if t.get("direction") == "unknown")
+    
+    logger.info(f"Post-processing: {len(transactions)} -> {len(normalized)} normalized -> {len(deduplicated)} deduplicated")
+    logger.info(f"Post-processing direction breakdown: {income_count} income, {expense_count} expense, {unknown_count} unknown")
+    
+    return deduplicated
 
 
 def categorize_transaction_openai(client: OpenAI, description: str, amount: float, direction: str = "expense") -> tuple:
@@ -1000,139 +1684,749 @@ def home_page():
                 st.rerun()
 
 
+def _detect_date_column(series: pd.Series) -> bool:
+    """Check if a series contains date-like values."""
+    if series.empty:
+        return False
+    
+    # Sample first 10 non-null values
+    sample = series.dropna().head(10)
+    if len(sample) == 0:
+        return False
+    
+    date_patterns = [
+        r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}',  # MM/DD/YYYY, DD/MM/YYYY
+        r'\d{4}-\d{2}-\d{2}',  # YYYY-MM-DD
+        r'\d{1,2}\s+[A-Z][a-z]{2,8}\s+\d{4}',  # DD Mon YYYY
+    ]
+    
+    date_count = 0
+    for val in sample:
+        val_str = str(val).strip()
+        # Skip empty or obviously non-date values
+        if not val_str or len(val_str) < 6:
+            continue
+        for pattern in date_patterns:
+            if re.search(pattern, val_str):
+                date_count += 1
+                break
+    
+    # Consider it a date column if at least 50% of samples match date patterns
+    # But require at least 1 match
+    return date_count >= max(1, len(sample) * 0.5)
+
+
+def _find_header_row(csv_content: str, max_skip: int = 10) -> int:
+    """Find the header row by looking for a row with date-like column."""
+    lines = csv_content.split('\n')
+    
+    # Try different separators
+    separators = [',', ';', '\t']
+    
+    # Collect sample rows to check for date patterns
+    sample_rows = []
+    for skip in range(min(max_skip + 5, len(lines))):  # Get a few extra rows for sampling
+        for sep in separators:
+            if not lines[skip].strip():
+                continue
+            
+            try:
+                row = lines[skip].split(sep)
+                if len(row) >= 2:
+                    sample_rows.append((skip, sep, row))
+                    break  # Found a valid row with this separator
+            except:
+                continue
+    
+    # Now check which row has date-like columns by sampling subsequent rows
+    for skip, sep, header_row in sample_rows[:max_skip]:
+        # Check if this row and next few rows have date-like values in same column
+        date_patterns = [
+            r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}',  # MM/DD/YYYY, DD/MM/YYYY
+            r'\d{4}-\d{2}-\d{2}',  # YYYY-MM-DD
+        ]
+        
+        # Check first few columns for date patterns
+        for col_idx in range(min(5, len(header_row))):
+            col_val = str(header_row[col_idx]).strip()
+            # Check if this column value matches a date pattern
+            if any(re.search(pattern, col_val) for pattern in date_patterns):
+                # Also check if subsequent rows have dates in same column
+                date_count = 0
+                for check_skip in range(skip + 1, min(skip + 4, len(lines))):
+                    if check_skip < len(lines) and lines[check_skip].strip():
+                        try:
+                            check_row = lines[check_skip].split(sep)
+                            if col_idx < len(check_row):
+                                check_val = str(check_row[col_idx]).strip()
+                                if any(re.search(pattern, check_val) for pattern in date_patterns):
+                                    date_count += 1
+                        except:
+                            pass
+                
+                # If we found dates in this column across multiple rows, this is likely the header
+                if date_count >= 1:
+                    logger.info(f"Found header row at line {skip + 1} (0-indexed: {skip})")
+                    return skip
+    
+    # Default to first row
+    return 0
+
+
+def _normalize_date(date_str: str) -> Optional[str]:
+    """Normalize date string to YYYY-MM-DD format."""
+    if not date_str or pd.isna(date_str):
+        return None
+    
+    date_str = str(date_str).strip()
+    if not date_str or date_str.lower() in ['nan', 'none', '']:
+        return None
+    
+    # Try pandas to_datetime first (handles many formats)
+    try:
+        dt = pd.to_datetime(date_str, infer_datetime_format=True, errors='coerce')
+        if pd.notna(dt):
+            return dt.strftime('%Y-%m-%d')
+    except:
+        pass
+    
+    # Manual parsing for common formats
+    # MM/DD/YYYY or DD/MM/YYYY
+    match = re.match(r'(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})', date_str)
+    if match:
+        part1, part2, part3 = match.groups()
+        year = int(part3)
+        if year < 100:
+            year += 2000 if year < 50 else 1900
+        
+        # Heuristic: if part1 > 12, it's DD/MM format
+        if int(part1) > 12:
+            day, month = int(part1), int(part2)
+        else:
+            month, day = int(part1), int(part2)
+        
+        try:
+            dt = datetime(year, month, day)
+            return dt.strftime('%Y-%m-%d')
+        except:
+            pass
+    
+    # YYYY-MM-DD
+    match = re.match(r'(\d{4})-(\d{2})-(\d{2})', date_str)
+    if match:
+        year, month, day = map(int, match.groups())
+        try:
+            dt = datetime(year, month, day)
+            return dt.strftime('%Y-%m-%d')
+        except:
+            pass
+    
+    return None
+
+
+def _parse_amount(value) -> Optional[float]:
+    """Parse amount value, handling various formats. Returns positive absolute value."""
+    if pd.isna(value):
+        return None
+    
+    try:
+        # Convert to string and clean
+        val_str = str(value).strip()
+        if not val_str or val_str.lower() in ['nan', 'none', '']:
+            return None
+        
+        # Remove currency symbols and commas
+        val_str = re.sub(r'[\$€£¥,\s]', '', val_str)
+        
+        # Handle parentheses (negative)
+        is_negative = False
+        if val_str.startswith('(') and val_str.endswith(')'):
+            val_str = val_str[1:-1]
+            is_negative = True
+        
+        # Parse as float
+        amount = float(val_str)
+        if is_negative:
+            amount = -amount
+        
+        return abs(amount) if amount != 0 else None
+    except:
+        return None
+
+
+def _parse_amount_with_sign(value) -> Optional[tuple]:
+    """
+    Parse amount value with sign preserved.
+    Returns (amount_abs, is_negative) tuple or None.
+    """
+    if pd.isna(value):
+        return None
+    
+    try:
+        # Convert to string and clean
+        val_str = str(value).strip()
+        if not val_str or val_str.lower() in ['nan', 'none', '']:
+            return None
+        
+        # Check for leading minus sign
+        has_minus = val_str.startswith('-')
+        
+        # Remove currency symbols and commas (but preserve minus if at start)
+        val_clean = val_str.lstrip('-').lstrip('+')
+        val_clean = re.sub(r'[\$€£¥,\s]', '', val_clean)
+        
+        # Handle parentheses (negative)
+        is_negative = False
+        if val_str.startswith('(') and val_str.endswith(')'):
+            val_clean = val_str[1:-1]
+            val_clean = re.sub(r'[\$€£¥,\s]', '', val_clean)
+            is_negative = True
+        elif has_minus:
+            is_negative = True
+        
+        # Parse as float
+        amount = float(val_clean)
+        if amount == 0:
+            return None
+        
+        return (abs(amount), is_negative)
+    except:
+        return None
+
+
 def parse_csv_transactions(csv_file) -> List[Dict]:
     """
-    Parse CSV file and extract transactions.
-    Tries to automatically detect date, description, and amount columns.
+    Robustly parse CSV file and extract bank transactions.
+    
+    Features:
+    - Auto-detects header row (skips metadata rows)
+    - Handles comma and semicolon separators
+    - Dynamically detects date, description, debit, credit, amount columns
+    - Handles multiple date formats
+    - Never fails silently - provides clear error messages
     """
     try:
-        # Read CSV
-        df = pd.read_csv(csv_file)
+        # Read file content to detect separator and header
+        csv_file.seek(0)
+        csv_content = csv_file.read().decode('utf-8', errors='ignore')
+        csv_file.seek(0)
+        
+        # Detect separator
+        separator = ','
+        if ';' in csv_content[:500]:  # Check first 500 chars
+            separator = ';'
+        elif '\t' in csv_content[:500]:
+            separator = '\t'
+        
+        # Find header row
+        header_row = _find_header_row(csv_content, max_skip=10)
+        
+        # Read CSV with detected separator and header row
+        # IMPORTANT: Use on_bad_lines='skip' to handle malformed rows, but we want to keep ALL valid rows
+        csv_file.seek(0)
+        try:
+            # Try with on_bad_lines (pandas >= 1.3.0)
+            df = pd.read_csv(csv_file, sep=separator, skiprows=header_row, dtype=str, 
+                           keep_default_na=False, on_bad_lines='skip', engine='python')
+        except TypeError:
+            # Older pandas version - use error_bad_lines
+            csv_file.seek(0)
+            try:
+                df = pd.read_csv(csv_file, sep=separator, skiprows=header_row, dtype=str, 
+                               keep_default_na=False, error_bad_lines=False, warn_bad_lines=True, engine='python')
+            except:
+                # Last resort: read with minimal options, use python engine for better compatibility
+                csv_file.seek(0)
+                df = pd.read_csv(csv_file, sep=separator, skiprows=header_row, dtype=str, 
+                               keep_default_na=False, engine='python')
+        except Exception as e:
+            # If all else fails, try with C engine
+            csv_file.seek(0)
+            logger.warning(f"Python engine failed, trying C engine: {e}")
+            df = pd.read_csv(csv_file, sep=separator, skiprows=header_row, dtype=str, 
+                           keep_default_na=False)
+        csv_file.seek(0)
+        
+        # LOGGING CHECKPOINT: After reading CSV
+        logger.info(f"CSV parsing checkpoint: Read {len(df)} rows after header detection (header_row={header_row})")
+        logger.info(f"CSV total columns: {len(df.columns)}, column names: {list(df.columns)}")
+        if len(df) > 0:
+            logger.debug(f"CSV first 3 rows:\n{df.head(3).to_string()}")
+            logger.debug(f"CSV last 3 rows:\n{df.tail(3).to_string()}")
         
         if df.empty:
-            return []
+            raise ValueError("CSV file is empty or has no data rows")
+        
+        # Clean column names (strip whitespace)
+        df.columns = [str(col).strip() for col in df.columns]
+        
+        # LOGGING CHECKPOINT: After header detection
+        logger.info(f"CSV parsing checkpoint: After header detection, {len(df)} rows, columns: {list(df.columns)}")
         
         # Show CSV preview
         with st.expander("View CSV Preview"):
-            st.dataframe(df.head(), use_container_width=True)
+            st.dataframe(df.head(10), use_container_width=True)
+            st.caption(f"Detected header at row {header_row + 1}, separator: '{separator}'")
         
-        # Try to identify columns automatically
+        # ============================================================================
+        # DYNAMIC COLUMN DETECTION
+        # ============================================================================
+        
         date_col = None
         desc_col = None
+        debit_col = None
+        credit_col = None
         amount_col = None
         
-        # Look for common column names
+        # Detect date column
         for col in df.columns:
-            col_lower = col.lower()
-            if not date_col and any(x in col_lower for x in ['date', 'posted', 'transaction_date']):
-                date_col = col
-            if not desc_col and any(x in col_lower for x in ['description', 'merchant', 'payee', 'details', 'memo', 'note']):
+            col_lower = str(col).lower()
+            if any(x in col_lower for x in ['date', 'posted', 'transaction_date', 'post_date', 'trans_date']):
+                # Verify it actually contains dates
+                if _detect_date_column(df[col].head(20)):
+                    date_col = col
+                    break
+        
+        # If not found by name, try to detect by content
+        if not date_col:
+            for col in df.columns:
+                if _detect_date_column(df[col].head(20)):
+                    date_col = col
+                    break
+        
+        # Detect description column
+        for col in df.columns:
+            col_lower = str(col).lower()
+            if any(x in col_lower for x in ['description', 'merchant', 'payee', 'details', 'memo', 'note', 'narrative', 'particulars']):
                 desc_col = col
-            if not amount_col and any(x in col_lower for x in ['amount', 'value', 'debit', 'credit', 'balance']):
-                amount_col = col
+                break
         
-        # If not found, use first few columns as guesses
-        if not date_col and len(df.columns) > 0:
-            date_col = df.columns[0]
-        if not desc_col and len(df.columns) > 1:
-            desc_col = df.columns[1]
-        if not amount_col and len(df.columns) > 2:
-            amount_col = df.columns[2]
-        
-        # Let user select columns if auto-detection unclear
-        if not all([date_col, desc_col, amount_col]):
-            st.info("💡 Please select the columns for your CSV file:")
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                date_col = st.selectbox("Date Column", options=df.columns.tolist(), index=0 if date_col else None)
-            with col2:
-                desc_col = st.selectbox("Description Column", options=df.columns.tolist(), index=1 if desc_col else None)
-            with col3:
-                amount_col = st.selectbox("Amount Column", options=df.columns.tolist(), index=2 if amount_col else None)
-        
-        # Extract transactions
-        transactions = []
-        for idx, row in df.iterrows():
-            try:
-                # Get date
-                date_val = str(row[date_col]) if date_col else ""
-                # Try to parse date
-                try:
-                    if pd.notna(date_val):
-                        # Try common date formats
-                        if '/' in date_val:
-                            parts = date_val.split('/')
-                            if len(parts) == 3:
-                                month, day, year = parts
-                                if len(year) == 2:
-                                    year = '20' + year
-                                posted_date = f"{year}-{month.zfill(2)}-{day.zfill(2)}"
-                            else:
-                                posted_date = date_val
-                        elif '-' in date_val:
-                            posted_date = date_val
-                        else:
-                            posted_date = date_val
-                    else:
-                        continue
-                except:
-                    posted_date = date_val
-                
-                # Get description
-                description = str(row[desc_col]) if desc_col and pd.notna(row[desc_col]) else "Unknown"
-                
-                # Get amount
-                try:
-                    amount = abs(float(row[amount_col])) if amount_col and pd.notna(row[amount_col]) else 0
-                except:
-                    amount = 0
-                
-                if amount == 0:
+        # Fallback: Detect description column by content (text that's not date, not numeric)
+        if not desc_col:
+            for col in df.columns:
+                if col == date_col:  # Skip date column
+                    continue
+                # Check if column contains mostly text (not numeric, not dates)
+                sample = df[col].head(20).dropna()
+                if len(sample) == 0:
                     continue
                 
-                # Determine direction - positive amounts are usually income
-                direction = "expense"
-                if amount_col:
+                # Count non-numeric, non-date values
+                text_count = 0
+                for val in sample:
+                    val_str = str(val).strip()
+                    if not val_str or val_str.lower() in ['nan', 'none', '']:
+                        continue
+                    
+                    # Skip if it's numeric
                     try:
-                        amt_val = float(row[amount_col])
-                        if amt_val > 0:
-                            # Check column name for hints
-                            if 'credit' in str(amount_col).lower() or 'deposit' in str(amount_col).lower() or 'income' in str(amount_col).lower():
-                                direction = "income"
-                            elif 'debit' in str(amount_col).lower() or 'withdrawal' in str(amount_col).lower() or 'expense' in str(amount_col).lower():
-                                direction = "expense"
-                            else:
-                                # Default: positive amounts are usually income
-                                direction = "income"
-                        else:
-                            # Negative amounts are expenses
-                            direction = "expense"
+                        float(re.sub(r'[\$€£¥,\s]', '', val_str))
+                        continue
                     except:
                         pass
-                else:
-                    # If no amount column, default to expense
-                    direction = "expense"
+                    
+                    # Skip if it's a date
+                    if _normalize_date(val_str):
+                        continue
+                    
+                    # If it's text and has reasonable length, count it
+                    if len(val_str) > 3:
+                        text_count += 1
+                
+                # If most values are text descriptions, this is likely the description column
+                if text_count >= max(2, len(sample) * 0.6):
+                    desc_col = col
+                    logger.info(f"Detected description column by content: {col}")
+                    break
+        
+        # Detect debit column
+        for col in df.columns:
+            col_lower = str(col).lower()
+            if any(x in col_lower for x in ['debit', 'withdrawal', 'payment', 'out', 'paid', 'spent']):
+                # Check if column has numeric values (not category names)
+                sample = df[col].head(20).dropna()
+                if len(sample) > 0:
+                    # Verify it's actually numeric, not text categories
+                    numeric_count = 0
+                    for val in sample:
+                        if _parse_amount(val) is not None:
+                            numeric_count += 1
+                    
+                    # Only treat as debit column if most values are numeric
+                    if numeric_count >= max(2, len(sample) * 0.7):
+                        debit_col = col
+                        break
+        
+        # Detect credit column
+        for col in df.columns:
+            col_lower = str(col).lower()
+            if any(x in col_lower for x in ['credit', 'deposit', 'income', 'in', 'received']):
+                # Check if column has numeric values (not category names)
+                sample = df[col].head(20).dropna()
+                if len(sample) > 0:
+                    # Verify it's actually numeric, not text categories
+                    numeric_count = 0
+                    for val in sample:
+                        if _parse_amount(val) is not None:
+                            numeric_count += 1
+                    
+                    # Only treat as credit column if most values are numeric
+                    if numeric_count >= max(2, len(sample) * 0.7):
+                        credit_col = col
+                        break
+        
+        # Detect single amount column (if debit/credit not found separately)
+        if not debit_col and not credit_col:
+            # First try by name
+            for col in df.columns:
+                col_lower = str(col).lower()
+                if any(x in col_lower for x in ['amount', 'value', 'balance']):
+                    # Check if column has numeric values
+                    sample = df[col].head(20).dropna()
+                    if len(sample) > 0:
+                        if _parse_amount(sample.iloc[0]) is not None:
+                            amount_col = col
+                            break
+            
+            # Fallback: Detect amount column by content (numeric values, excluding date column)
+            if not amount_col:
+                for col in df.columns:
+                    if col == date_col:  # Skip date column
+                        continue
+                    
+                    # Check if column contains mostly numeric values
+                    sample = df[col].head(20).dropna()
+                    if len(sample) == 0:
+                        continue
+                    
+                    numeric_count = 0
+                    for val in sample:
+                        if _parse_amount(val) is not None:
+                            numeric_count += 1
+                    
+                    # If most values are numeric, this is likely the amount column
+                    if numeric_count >= max(2, len(sample) * 0.7):
+                        amount_col = col
+                        logger.info(f"Detected amount column by content: {col}")
+                        break
+        
+        # ============================================================================
+        # VALIDATION AND ERROR REPORTING
+        # ============================================================================
+        
+        # Log detected columns for debugging
+        logger.info(f"Detected columns - Date: {date_col}, Description: {desc_col}, "
+                   f"Debit: {debit_col}, Credit: {credit_col}, Amount: {amount_col}")
+        
+        missing_cols = []
+        if not date_col:
+            missing_cols.append("date")
+        if not desc_col:
+            missing_cols.append("description")
+        if not debit_col and not credit_col and not amount_col:
+            missing_cols.append("amount/debit/credit")
+        
+        if missing_cols:
+            error_msg = f"❌ Could not detect required columns: {', '.join(missing_cols)}\n\n"
+            error_msg += f"**Detected columns:** {', '.join(df.columns.tolist())}\n\n"
+            error_msg += "**Column analysis:**\n"
+            for col in df.columns:
+                sample = df[col].head(3).tolist()
+                error_msg += f"- '{col}': {sample}\n"
+            error_msg += "\n**Sample rows:**\n"
+            for idx, row in df.head(3).iterrows():
+                error_msg += f"Row {idx}: {dict(row)}\n"
+            
+            logger.error(error_msg)
+            st.error(error_msg)
+            raise ValueError(f"Missing required columns: {', '.join(missing_cols)}")
+        
+        # ============================================================================
+        # EXTRACT TRANSACTIONS
+        # ============================================================================
+        
+        transactions = []
+        errors = []
+        
+        # LOGGING CHECKPOINT: Before extraction
+        logger.info(f"CSV parsing checkpoint: Starting transaction extraction from {len(df)} rows")
+        logger.info(f"CSV row indices: {list(df.index[:10])}... (showing first 10)")
+        
+        rows_processed = 0
+        rows_skipped = 0
+        
+        for idx, row in df.iterrows():
+            rows_processed += 1
+            try:
+                # Parse date - be lenient, try multiple columns if needed
+                posted_date = None
+                date_val = None
+                
+                # Try the detected date column first
+                if date_col:
+                    date_val = row[date_col] if date_col else ""
+                    posted_date = _normalize_date(date_val)
+                
+                # If date parsing failed, try other columns that might contain dates
+                if not posted_date:
+                    for col in df.columns:
+                        if col == date_col or col == desc_col:
+                            continue
+                        # Try to parse this column as a date
+                        test_val = str(row[col]).strip() if pd.notna(row[col]) else ""
+                        if test_val and len(test_val) >= 6:  # Minimum date length
+                            test_date = _normalize_date(test_val)
+                            if test_date:
+                                posted_date = test_date
+                                date_val = test_val
+                                logger.debug(f"Row {idx}: Found date in column '{col}' instead of '{date_col}': {test_date}")
+                                break
+                
+                # Only skip if truly no date found anywhere
+                if not posted_date:
+                    errors.append(f"Row {idx}: Invalid date in '{date_col}': '{date_val}'. Tried all columns.")
+                    # Don't skip - create a placeholder date so we don't lose the transaction
+                    # Use today's date as fallback
+                    posted_date = datetime.now().strftime('%Y-%m-%d')
+                    logger.warning(f"Row {idx}: Using fallback date {posted_date} for transaction")
+                
+                # Parse description
+                description = str(row[desc_col]).strip() if desc_col and pd.notna(row[desc_col]) else "Unknown Transaction"
+                if not description or description.lower() in ['nan', 'none', '']:
+                    description = "Unknown Transaction"
+                
+                # Parse amount and direction
+                # PRIORITY: Amount signs are the strongest signal for direction
+                amount = None
+                direction = None
+                amount_signed = None  # Preserve original sign
+                
+                # Priority 1: Separate debit/credit columns (strongest signal)
+                if debit_col and pd.notna(row[debit_col]) and str(row[debit_col]).strip():
+                    parsed = _parse_amount_with_sign(row[debit_col])
+                    if parsed:
+                        amount_abs, is_negative = parsed
+                        if amount_abs > 0:
+                            amount = amount_abs
+                            amount_signed = -amount_abs if is_negative else amount_abs
+                            direction = "expense"  # Debit column = expense
+                
+                if credit_col and pd.notna(row[credit_col]) and str(row[credit_col]).strip():
+                    parsed = _parse_amount_with_sign(row[credit_col])
+                    if parsed:
+                        credit_abs, is_negative = parsed
+                        if credit_abs > 0:
+                            # Prefer credit if both exist, or if no debit found
+                            if amount is None or credit_abs >= amount:
+                                amount = credit_abs
+                                amount_signed = -credit_abs if is_negative else credit_abs
+                                direction = "income"  # Credit column = income
+                
+                # Priority 2: Single amount column - PRIORITIZE SIGN
+                if amount is None and amount_col:
+                    parsed = _parse_amount_with_sign(row[amount_col])
+                    if parsed:
+                        amount_abs, is_negative = parsed
+                        amount = amount_abs
+                        amount_signed = -amount_abs if is_negative else amount_abs
+                        
+                        # PRIORITY: Use sign to determine direction
+                        if is_negative:
+                            direction = "expense"  # Negative amount = expense
+                        else:
+                            # Positive amount - check column name hints
+                            col_lower = str(amount_col).lower()
+                            if 'credit' in col_lower or 'deposit' in col_lower or 'income' in col_lower:
+                                direction = "income"
+                            elif 'debit' in col_lower or 'withdrawal' in col_lower or 'expense' in col_lower:
+                                direction = "expense"
+                            else:
+                                # Positive amount without column hints - could be either
+                                # Use deterministic inference
+                                temp_txn = {
+                                    "description_raw": description,
+                                    "merchant_guess": description[:50],
+                                    "amount": amount,
+                                    "raw_row": {str(k): str(v) for k, v in row.items()}
+                                }
+                                direction, _ = _infer_direction_with_confidence(temp_txn)
+                
+                # Priority 3: Try to find amount in ANY column if not found yet
+                # This ensures we don't miss transactions - be very aggressive
+                if amount is None:
+                    # First, try columns we already identified but might have missed
+                    for col in [debit_col, credit_col, amount_col]:
+                        if col and pd.notna(row[col]) and str(row[col]).strip():
+                            parsed = _parse_amount_with_sign(row[col])
+                            if parsed:
+                                amount_abs, is_negative = parsed
+                                if amount_abs > 0:
+                                    amount = amount_abs
+                                    amount_signed = -amount_abs if is_negative else amount_abs
+                                    # Use sign and column type
+                                    if col == debit_col:
+                                        direction = "expense"
+                                    elif col == credit_col:
+                                        direction = "income"
+                                    elif is_negative:
+                                        direction = "expense"
+                                    else:
+                                        temp_txn = {
+                                            "description_raw": description,
+                                            "merchant_guess": description[:50],
+                                            "amount": amount,
+                                            "raw_row": {str(k): str(v) for k, v in row.items()}
+                                        }
+                                        direction, _ = _infer_direction_with_confidence(temp_txn)
+                                    logger.debug(f"Row {idx}: Found amount in column '{col}': {amount_signed}")
+                                    break
+                    
+                    # If still not found, try ALL other columns
+                    if amount is None:
+                        for col in df.columns:
+                            if col in [date_col, desc_col, debit_col, credit_col, amount_col]:
+                                continue
+                            
+                            parsed = _parse_amount_with_sign(row[col])
+                            if parsed:
+                                amount_abs, is_negative = parsed
+                                if amount_abs > 0:
+                                    amount = amount_abs
+                                    amount_signed = -amount_abs if is_negative else amount_abs
+                                    # Use sign as primary signal
+                                    if is_negative:
+                                        direction = "expense"
+                                    else:
+                                        # Positive - use inference
+                                        temp_txn = {
+                                            "description_raw": description,
+                                            "merchant_guess": description[:50],
+                                            "amount": amount,
+                                            "raw_row": {str(k): str(v) for k, v in row.items()}
+                                        }
+                                        direction, _ = _infer_direction_with_confidence(temp_txn)
+                                    logger.debug(f"Row {idx}: Found amount in unexpected column '{col}': {amount_signed}")
+                                    break
+                
+                # Only skip if truly no amount found (don't skip based on direction)
+                # Log what we tried if amount is still None
+                if amount is None or amount == 0:
+                    # Try to provide helpful error message
+                    tried_cols = []
+                    if debit_col:
+                        tried_cols.append(f"debit({debit_col})")
+                    if credit_col:
+                        tried_cols.append(f"credit({credit_col})")
+                    if amount_col:
+                        tried_cols.append(f"amount({amount_col})")
+                    # Log all column values for debugging
+                    row_preview = {k: str(v)[:50] for k, v in list(row.items())[:10]}
+                    errors.append(f"Row {idx}: No valid amount found. Tried columns: {', '.join(tried_cols) if tried_cols else 'none detected'}. Row preview: {row_preview}")
+                    logger.warning(f"Row {idx} skipped: No amount found. All values: {dict(row)}")
+                    rows_skipped += 1
+                    continue
+                
+                # If direction still not determined, use deterministic inference
+                if not direction:
+                    temp_txn = {
+                        "description_raw": description,
+                        "merchant_guess": description[:50],
+                        "amount": amount,
+                        "raw_row": {str(k): str(v) for k, v in row.items()}
+                    }
+                    direction, _ = _infer_direction_with_confidence(temp_txn)
+                    # Allow "unknown" direction - don't force to expense
+                
+                # Auto-assign category based on direction
+                category = _assign_category_from_direction({
+                    "direction": direction,
+                    "description_raw": description,
+                    "merchant_guess": description[:50]
+                })
                 
                 # Merchant guess
                 merchant_guess = description[:50] if len(description) > 50 else description
+                
+                # Store raw row for debugging
+                raw_row = {str(k): str(v) for k, v in row.items()}
                 
                 transactions.append({
                     "posted_date": posted_date,
                     "description_raw": description,
                     "merchant_guess": merchant_guess,
                     "amount": round(amount, 2),
-                    "direction": direction,
-                    "category": "Uncategorized",
+                    "direction": direction,  # Can be "income", "expense", or "unknown"
+                    "category": category,
                     "source": "statement_csv",
-                    "confidence": 0.9
+                    "confidence": 0.9,
+                    "raw_row": raw_row  # For debugging
                 })
+                
             except Exception as e:
+                # Log full row data when there's an error so we can debug
+                row_preview = {k: str(v)[:50] for k, v in list(row.items())[:10]}
+                errors.append(f"Row {idx}: Exception '{str(e)}'. Row preview: {row_preview}")
+                logger.error(f"Error parsing row {idx}: {e}. Full row: {dict(row)}", exc_info=True)
+                rows_skipped += 1
                 continue
         
+        # ============================================================================
+        # VALIDATION AND REPORTING
+        # ============================================================================
+        
+        # LOGGING CHECKPOINT: After extraction
+        logger.info(f"CSV parsing checkpoint: After extraction, {len(transactions)} transactions extracted from {len(df)} rows")
+        logger.info(f"CSV parsing: Processed {rows_processed} rows, skipped {rows_skipped} rows, {len(errors)} errors")
+        if transactions:
+            logger.debug(f"CSV extracted transactions sample (first 3):\n{pd.DataFrame(transactions[:3]).to_string()}")
+            # Log direction breakdown
+            income_count = sum(1 for t in transactions if t.get("direction") == "income")
+            expense_count = sum(1 for t in transactions if t.get("direction") == "expense")
+            unknown_count = sum(1 for t in transactions if t.get("direction") == "unknown")
+            logger.info(f"CSV direction breakdown: {income_count} income, {expense_count} expense, {unknown_count} unknown")
+        else:
+            logger.warning(f"CSV parsing: No transactions extracted from {len(df)} rows!")
+            logger.warning(f"CSV sample rows:\n{df.head(5).to_string()}")
+        
+        if not transactions:
+            error_msg = "❌ No valid transactions found in CSV file.\n\n"
+            error_msg += f"**Detected columns:** {', '.join(df.columns.tolist())}\n\n"
+            error_msg += f"**Total rows processed:** {len(df)}\n\n"
+            error_msg += "**First 3 rows of dataframe:**\n"
+            error_msg += df.head(3).to_string()
+            error_msg += "\n\n"
+            if errors:
+                error_msg += f"**Errors encountered:**\n" + "\n".join(errors[:10])
+                if len(errors) > 10:
+                    error_msg += f"\n... and {len(errors) - 10} more errors"
+            
+            logger.error(error_msg)
+            st.error(error_msg)
+            # Show dataframe preview in UI
+            with st.expander("View CSV Data (for debugging)"):
+                st.dataframe(df.head(10), use_container_width=True)
+            raise ValueError("No valid transactions found")
+        
+        # Log warnings for errors but don't fail
+        if errors:
+            logger.warning(f"Encountered {len(errors)} errors while parsing CSV (skipped invalid rows)")
+            with st.expander(f"⚠️ Parsing Warnings ({len(errors)} rows skipped)"):
+                st.text("\n".join(errors[:20]))
+                if len(errors) > 20:
+                    st.caption(f"... and {len(errors) - 20} more errors")
+        
+        logger.info(f"Successfully parsed {len(transactions)} transactions from CSV")
         return transactions
         
     except Exception as e:
-        st.error(f"❌ Error parsing CSV: {str(e)}")
+        error_msg = f"❌ Error parsing CSV: {str(e)}\n\n"
+        error_msg += "**Troubleshooting:**\n"
+        error_msg += "- Ensure the CSV has a header row with column names\n"
+        error_msg += "- Check that date, description, and amount columns exist\n"
+        error_msg += "- Verify the file is not corrupted\n"
+        
+        logger.error(error_msg)
+        st.error(error_msg)
         return []
 
 
@@ -1244,12 +2538,34 @@ def upload_statement_page():
                 st.warning("⚠️ Please set your OpenAI API key in the code (OPENAI_API_KEY constant) to enable PDF parsing.")
                 return
             
-            st.info("📝 Processing PDF with OpenAI... This may take a moment.")
-            
-            # Extract transactions using OpenAI directly from PDF
+            # Extract transactions using deterministic + optional AI
             client = get_openai_client()
-            with st.spinner("🤖 Using OpenAI to extract transactions from PDF (this may take 30-60 seconds)..."):
-                transactions = extract_transactions_from_pdf_with_openai(client, uploaded_file)
+            extraction_result = extract_transactions_from_pdf_with_openai(client, uploaded_file, use_ai=False, min_txns=5)
+            
+            # Show parsing diagnostics
+            with st.expander("📊 Parsing Diagnostics", expanded=False):
+                diag = extraction_result["diagnostics"]
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Deterministic", f"{diag['deterministic_count']}", 
+                             f"Confidence: {diag['deterministic_confidence']:.0%}")
+                with col2:
+                    ai_status = extraction_result["ai_status"]
+                    if ai_status == "idle":
+                        st.metric("AI Extraction", "Skipped", "Not needed")
+                    elif ai_status == "running":
+                        st.metric("AI Extraction", "Running...", "")
+                    elif ai_status == "completed":
+                        st.metric("AI Extraction", f"{diag['ai_count']}", 
+                                 f"{diag['ai_duration']:.1f}s")
+                    else:
+                        st.metric("AI Extraction", ai_status.title(), "Failed/Timeout")
+                with col3:
+                    st.metric("Final Result", f"{diag['merged_count']}", 
+                             f"+{diag['added_by_ai']} added, {diag['enriched_by_ai']} enriched")
+            
+            # Use final transactions (deterministic + merged AI if available)
+            transactions = extraction_result["final_txns"]
         
         elif file_type == "csv":
             st.info("📝 Processing CSV file...")
@@ -1260,7 +2576,11 @@ def upload_statement_page():
             st.error("❌ Unsupported file type. Please upload a PDF or CSV file.")
             return
         
-        if transactions:
+        if transactions and len(transactions) > 0:
+            # Apply post-processing pipeline (normalization, direction inference, deduplication)
+            with st.spinner("Post-processing transactions..."):
+                transactions = post_process_transactions(transactions)
+            
             st.success(f"✅ Extracted {len(transactions)} transactions!")
             
             # Convert to DataFrame
@@ -1294,7 +2614,11 @@ def upload_statement_page():
         else:
             # No transactions found
             if file_type == "pdf":
-                st.warning("⚠️ No transactions found in the PDF. The PDF might not contain recognizable transaction data.")
+                # Check if we have deterministic results that were discarded
+                if 'extraction_result' in locals() and extraction_result.get("deterministic_txns"):
+                    st.warning(f"⚠️ Deterministic parser found {len(extraction_result['deterministic_txns'])} transactions, but final merge resulted in 0. Check diagnostics above.")
+                else:
+                    st.warning("⚠️ No transactions found in the PDF. The PDF might not contain recognizable transaction data.")
             elif file_type == "csv":
                 st.warning("⚠️ No transactions found in the CSV. Please check the file format.")
 
